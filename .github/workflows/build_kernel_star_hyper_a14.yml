@@ -8,21 +8,16 @@ jobs:
     runs-on: ubuntu-22.04
 
     env:
-      # Caminho do perfil (já existente no repo)
       PROFILE_FILE: Profiles/star_hyper_a14.env
-      # Direto para onde vamos clonar a árvore do kernel
       KERNEL_DIR: device_kernel
-      # AnyKernel3 opcional (se não existir, o passo ignora)
       AK3_DIR: AnyKernel3
 
     steps:
-      # 0) Checkout do repositório (seu fork)
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # 1) Obter AnyKernel3 (opcional; se já estiver no repo, não faz nada)
       - name: Obter AnyKernel3 (se não houver)
         shell: bash
         run: |
@@ -34,57 +29,68 @@ jobs:
             echo "✓ AnyKernel3 já presente."
           fi
 
-      # 2) (Opcional) Baixar e preparar LLVM/Clang do perfil
-      #    Esse passo depende do CLANG_SOURCE estar definido no perfil
       - name: (Opcional) Baixar e preparar LLVM/Clang do perfil
         shell: bash
         run: |
           set -euo pipefail
+
+          # Exporta variáveis úteis do perfil para o ambiente
           if [[ -f "$PROFILE_FILE" ]]; then
-            # Exporta só as linhas chave=valor, removendo prefixos "CUSTOM_CMDS:" e "EXTRA_CMDS:"
-            # e ignorando comentários/espaços.
             TMP_EXPORT="$(mktemp)"
             sed -E 's/^\s*#.*$//g; s/\r$//g' "$PROFILE_FILE" \
             | sed -E 's/^(CUSTOM_CMDS:|EXTRA_CMDS:)\s*//g' \
             | grep -E '^[A-Za-z0-9_]+=' > "$TMP_EXPORT" || true
-            # Carrega variáveis do perfil no ambiente
-            # shellcheck disable=SC2046
             export $(sed -n 's/^\([A-Za-z0-9_]\+\)=.*/\1/p' "$TMP_EXPORT")
-            # Persiste para os próximos passos
             cat "$TMP_EXPORT" >> "$GITHUB_ENV"
             rm -f "$TMP_EXPORT"
             echo "✓ Variáveis do perfil carregadas."
           fi
 
-          # Se não tem CLANG_SOURCE no perfil, apenas sai (build pode usar clang do sistema)
+          # Se o perfil não definir CLANG_SOURCE, pulamos (o build pode usar clang do sistema)
           if [[ -z "${CLANG_SOURCE:-}" ]]; then
-            echo "→ CLANG_SOURCE não definido no perfil; passo LLVM é opcional e será pulado."
+            echo "→ CLANG_SOURCE não definido; passo LLVM será pulado."
             exit 0
           fi
-        continue-on-error: false
 
-      # 2.1) Preparar LLVM/Clang (opcional) — BLOCO ROBUSTO
+      # ====== BLOCO ROBUSTO DO LLVM (com fallback para apt.llvm.org) ======
       - name: Preparar LLVM/Clang (opcional)
         if: ${{ env.CLANG_SOURCE != '' }}
         shell: bash
         run: |
           set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y curl xz-utils tar ca-certificates gnupg lsb-release
+
           mkdir -p toolchains && cd toolchains
 
           echo "→ Baixando LLVM/Clang de: $CLANG_SOURCE"
-          # Baixa com reintentos e retoma (-C -)
-          curl -L --retry 5 --retry-delay 10 -A "GitHubActions/1.0" -C - \
+          # Tentativa com reintentos e retomada
+          curl -L --retry 5 --retry-delay 10 -C - -A "GitHubActions/1.0" \
             "$CLANG_SOURCE" -o clang.tar.xz
 
-          echo "→ Validando o tarball..."
+          # (Opcional) validação por SHA256, se o perfil fornecer CLANG_SHA256
+          if [[ -n "${CLANG_SHA256:-}" ]]; then
+            echo "${CLANG_SHA256}  clang.tar.xz" | sha256sum -c - || {
+              echo "::warning::SHA256 não confere; tentando baixar novamente…"
+              rm -f clang.tar.xz
+              curl -L --retry 5 --retry-delay 10 -C - -A "GitHubActions/1.0" \
+                "$CLANG_SOURCE" -o clang.tar.xz
+              echo "${CLANG_SHA256}  clang.tar.xz" | sha256sum -c - || {
+                echo "::error::Tarball do LLVM corrompido após nova tentativa."
+                exit 2
+              }
+            }
+          fi
+
+          echo "→ Validando xz…"
           if ! xz -t clang.tar.xz 2>/dev/null; then
-            echo "Arquivo inválido (xz -t falhou). Dump rápido:"
+            echo "::warning::xz -t falhou; dump de arquivo:"
             file clang.tar.xz || true
             head -c 512 clang.tar.xz | od -An -tx1 || true
-            echo "-> Fallback: instalar Clang/Lld via apt.llvm.org"
+            echo "→ Fallback direto para apt.llvm.org (clang-19)"
             cd ..
-            sudo apt-get update
-            sudo apt-get install -y wget gnupg ca-certificates lsb-release
+            sudo apt-get install -y wget
             wget https://apt.llvm.org/llvm.sh
             chmod +x llvm.sh
             sudo ./llvm.sh 19 all
@@ -93,21 +99,47 @@ jobs:
             exit 0
           fi
 
-          echo "→ Extraindo..."
-          tar -xf clang.tar.xz
-          CLANG_DIR="$(ls -1d LLVM-* clang-* 2>/dev/null | head -n1)"
+          echo "→ Extraindo (tar xJf)…"
+          if ! tar -xJf clang.tar.xz; then
+            echo "::warning::tar -xJf falhou; tentando via pipe (xz -d -c | tar x)"
+            if ! xz -d -c clang.tar.xz | tar x; then
+              echo "::warning::Extração via pipe falhou também."
+              echo "Espaço/Memory debug:"
+              df -h || true
+              free -h || true
+              echo "→ Fallback para apt.llvm.org (clang-19)"
+              cd ..
+              sudo apt-get install -y wget
+              wget https://apt.llvm.org/llvm.sh
+              chmod +x llvm.sh
+              sudo ./llvm.sh 19 all
+              echo "CLANG_BIN=clang-19" >> "$GITHUB_ENV"
+              echo "LLD_BIN=ld.lld-19"  >> "$GITHUB_ENV"
+              exit 0
+            fi
+          fi
+
+          CLANG_DIR="$(ls -1d LLVM-* clang-* 2>/dev/null | head -n1 || true)"
           if [[ -z "$CLANG_DIR" ]]; then
-            echo "::error::Não foi possível localizar a pasta do LLVM/Clang após extrair."
+            echo "::warning::Não achei pasta do LLVM após extrair; listando…"
             ls -la
-            exit 10
+            echo "→ Fallback para apt.llvm.org (clang-19)"
+            cd ..
+            sudo apt-get install -y wget
+            wget https://apt.llvm.org/llvm.sh
+            chmod +x llvm.sh
+            sudo ./llvm.sh 19 all
+            echo "CLANG_BIN=clang-19" >> "$GITHUB_ENV"
+            echo "LLD_BIN=ld.lld-19"  >> "$GITHUB_ENV"
+            exit 0
           fi
 
           echo "PATH=$PWD/$CLANG_DIR/bin:$PATH" >> "$GITHUB_ENV"
           echo "CLANG_BIN=clang"  >> "$GITHUB_ENV"
           echo "LLD_BIN=ld.lld"   >> "$GITHUB_ENV"
           echo "✓ LLVM/Clang pronto em: $PWD/$CLANG_DIR/bin"
+      # ====== FIM DO BLOCO ROBUSTO DO LLVM ======
 
-      # 3) Clonar fonte do Kernel (usa KERNEL_SOURCE/KERNEL_BRANCH do perfil)
       - name: Clonar fonte do Kernel
         shell: bash
         run: |
@@ -124,52 +156,44 @@ jobs:
             echo "→ Clonando kernel: $KERNEL_SOURCE (branch: $KERNEL_BRANCH)"
             git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" "$KERNEL_DIR"
           fi
-          echo "✓ Kernel clonado em ./$KERNEL_DIR"
 
-      # 4) Compilar Kernel (defconfig + build) — usa CLANG_BIN/LLD_BIN automaticamente
       - name: Compilar Kernel (defconfig + build)
         shell: bash
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
 
-          # Usa DEFCONFIG_NAME do perfil (ex.: vendor/star_defconfig)
           : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
 
-          # Detecta toolchain escolhida (via passo LLVM) ou padrão
           CC_BIN="${CLANG_BIN:-clang}"
           LD_BIN="${LLD_BIN:-ld.lld}"
 
-          echo "→ Preparando saída O=out"
+          echo "→ Preparando O=out"
           mkdir -p out
-
-          echo "→ Limpando e aplicando defconfig: $DEFCONFIG_NAME"
           make -j"$(nproc)" O=out mrproper
           make -j"$(nproc)" O=out "$DEFCONFIG_NAME"
 
-          echo "→ Compilando com CC=$CC_BIN / LD=$LD_BIN"
+          echo "→ Build com CC=$CC_BIN / LD=$LD_BIN"
           make -j"$(nproc)" O=out \
             CC="$CC_BIN" LD="$LD_BIN" LLVM=1 LLVM_IAS=1 \
             ${CLANG_TRIPLE:+CLANG_TRIPLE=$CLANG_TRIPLE} \
             ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
             ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
 
-          echo "→ Artefatos produzidos:"
+          echo "→ Artefatos:"
           ls -lh out/arch/arm64/boot || true
 
-      # 5) Empacotar com AnyKernel3 (se disponível)
       - name: Empacotar com AnyKernel3
         shell: bash
         run: |
           set -euo pipefail
           if [[ ! -d "$AK3_DIR" ]]; then
-            echo "AnyKernel3 não está presente; pulando empacotamento."
+            echo "AnyKernel3 não presente; pulando."
             exit 0
           fi
 
           BOOT_DIR="$KERNEL_DIR/out/arch/arm64/boot"
           IMG=""
-          # Tenta formatos comuns
           for f in Image.gz-dtb Image.gz Image; do
             if [[ -f "$BOOT_DIR/$f" ]]; then
               IMG="$BOOT_DIR/$f"
@@ -178,7 +202,7 @@ jobs:
           done
 
           if [[ -z "$IMG" ]]; then
-            echo "::warning::Não encontrei Image*/Image.gz-dtb para empacotar."
+            echo "::warning::Nenhum Image*/Image.gz-dtb para empacotar."
             ls -lah "$BOOT_DIR" || true
             exit 0
           fi
@@ -191,7 +215,6 @@ jobs:
           ( cd "$AK3_DIR" && zip -r9 "../$ZIP_NAME" * >/dev/null )
           echo "PACKAGE_ZIP=$ZIP_NAME" >> "$GITHUB_ENV"
 
-      # 6) Publicar artefato (zip se disponível; senão, boot files)
       - name: Publicar artefato
         uses: actions/upload-artifact@v4
         with:
