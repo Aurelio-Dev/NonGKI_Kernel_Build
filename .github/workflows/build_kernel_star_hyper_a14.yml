@@ -1,70 +1,254 @@
-      - name: Integrar KernelSU (se ausente)
+name: Build Kernel • star_hyper_a14
+
+on:
+  workflow_dispatch:
+    inputs:
+      PROFILE_NAME:
+        description: "Nome do perfil em Profiles/ (ex.: star_hyper_a14)"
+        required: true
+        default: "star_hyper_a14"
+      MAKE_RELEASE:
+        description: "Publicar release?"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    env:
+      # Pastas padrão
+      WORKDIR: ${{ github.workspace }}
+      KDIR:    ${{ github.workspace }}/device_kernel
+      OUT:     ${{ github.workspace }}/device_kernel/out
+      CLANGDIR:${{ github.workspace }}/clang
+      AK3DIR:  ${{ github.workspace }}/AnyKernel3
+      PROFILE: ${{ inputs.PROFILE_NAME }}
+
+    steps:
+      - name: Checkout (este repositório)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Garantir ferramentas básicas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates ccache curl dos2unix \
+            flex git gzip libssl-dev lld llvm lz4 make python3 rsync tar \
+            unzip xz-utils zip zstd
+
+      - name: Carregar perfil e exportar variáveis
+        id: load_profile
         shell: bash
-        working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
 
-          # 1) Se drivers/kernelsu não existir, clona e injeta o código do KernelSU
-          if [[ ! -f drivers/kernelsu/Makefile ]]; then
-            echo "→ Injetando KernelSU em drivers/kernelsu/"
-            rm -rf /tmp/ksu
-            git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git /tmp/ksu
-            mkdir -p drivers/kernelsu
-            rsync -a --delete /tmp/ksu/kernel/ drivers/kernelsu/
+          PF="Profiles/${PROFILE}.env"
+          echo "-> Perfil: ${PF}"
+          test -f "${PF}" || { echo "::error::Perfil não encontrado: ${PF}"; exit 2; }
+
+          # Converte linhas "CHAVE:VALOR" para "export CHAVE='VALOR'"
+          # Mantém linhas no formato shell "VAR=valor" também.
+          TMP="${WORKDIR}/_profile_export.sh"
+          {
+            echo "set -euo pipefail"
+            echo "# exporta pares CHAVE:VALOR"
+            awk -F':' '/^[A-Za-z0-9_]+:/{k=$1; $1=""; sub(/^:/,""); v=$0; gsub(/^ +| +$/,"",v); printf("export %s=\"%s\"\n",k,v)}' "${PF}"
+            echo "# exporta VAR=VALOR (shell)"
+            awk -F'=' '/^[A-Za-z0-9_]+=/{print "export "$1"=\""substr($0,index($0,"=")+1)"\""}' "${PF}"
+          } > "${TMP}"
+
+          bash "${TMP}"
+
+          # Confere obrigatórios
+          : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
+          : "${KERNEL_BRANCH:?KERNEL_BRANCH não definido no perfil}"
+          : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
+
+          # Expõe a outros steps via GITHUB_ENV
+          {
+            echo "KERNEL_SOURCE=${KERNEL_SOURCE}"
+            echo "KERNEL_BRANCH=${KERNEL_BRANCH}"
+            echo "DEFCONFIG_NAME=${DEFCONFIG_NAME}"
+            echo "AK3_SOURCE=${AK3_SOURCE:-https://github.com/osm0sis/AnyKernel3.git}"
+            echo "AK3_BRANCH=${AK3_BRANCH:-master}"
+            echo "CLANG_SOURCE=${CLANG_SOURCE:-https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-Linux-X64.tar.xz}"
+            echo "CLANG_TRIPLE=${CLANG_TRIPLE:-aarch64-linux-gnu-}"
+          } >> "$GITHUB_ENV"
+
+          echo "✓ Ambiente pronto e variáveis do perfil carregadas com sucesso."
+
+      - name: (Opcional) Baixar e preparar LLVM/Clang do perfil
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Baixando LLVM/Clang de: ${CLANG_SOURCE}"
+
+          mkdir -p "${CLANGDIR}"
+          TARBALL="${WORKDIR}/clang.tar.xz"
+
+          # Tenta baixar com retry/restart
+          if ! curl -L --retry 3 --retry-delay 3 -C - "${CLANG_SOURCE}" -o "${TARBALL}"; then
+            echo "::warning::Falha no download do LLVM. Usando fallback via apt."
+            sudo apt-get update
+            sudo apt-get install -y clang-16 lld-16 llvm-16
+            echo "${WORKDIR}/clang-apt" >> $GITHUB_PATH
+            {
+              echo "CC=clang-16"
+              echo "LD=ld.lld-16"
+              echo "LLVM=1"
+              echo "LLVM_IAS=1"
+            } >> $GITHUB_ENV
           else
-            echo "✓ drivers/kernelsu já presente"
+            # Extrai clang tarball, se falhar -> fallback apt
+            if ! tar -xJf "${TARBALL}" -C "${CLANGDIR}" --strip-components=1; then
+              echo "::warning::Falha ao extrair LLVM. Usando fallback via apt."
+              sudo apt-get update
+              sudo apt-get install -y clang-16 lld-16 llvm-16
+              echo "${WORKDIR}/clang-apt" >> $GITHUB_PATH
+              {
+                echo "CC=clang-16"
+                echo "LD=ld.lld-16"
+                echo "LLVM=1"
+                echo "LLVM_IAS=1"
+              } >> $GITHUB_ENV
+            else
+              echo "${CLANGDIR}/bin" >> $GITHUB_PATH
+              {
+                echo "CC=clang"
+                echo "LD=ld.lld"
+                echo "LLVM=1"
+                echo "LLVM_IAS=1"
+              } >> $GITHUB_ENV
+            fi
           fi
 
-          # 2) Garantir referências em drivers/Kconfig
-          if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
-            echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
-            echo "→ Adicionado include do Kconfig do KernelSU em drivers/Kconfig"
-          else
-            echo "✓ drivers/Kconfig já referencia drivers/kernelsu/Kconfig"
-          fi
+          echo "✓ LLVM/Clang pronto."
 
-          # 3) Garantir referências em drivers/Makefile
-          if ! grep -q 'obj-\$(CONFIG_KSU) \+= kernelsu/' drivers/Makefile; then
-            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-            echo "→ Adicionado obj-$(CONFIG_KSU) += kernelsu/ em drivers/Makefile"
-          else
-            echo "✓ drivers/Makefile já referencia kernelsu/"
-          fi
+      - name: Clonar fonte do Kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${KERNEL_SOURCE}" || { echo "::error::KERNEL_SOURCE vazio"; exit 3; }
+          test -n "${KERNEL_BRANCH}" || { echo "::error::KERNEL_BRANCH vazio"; exit 3; }
 
-      # (opcional mas recomendado) saneamento de finais de linha/BOM que você já tem
-      # - name: Sanear Makefiles/Kconfig (CRLF/BOM/TAB)
-      #   ...
+          rm -rf "${KDIR}"
+          git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_SOURCE}" "${KDIR}"
+
+          # Normaliza CRLF → LF para evitar "missing separator" em Makefiles
+          cd "${KDIR}"
+          git ls-files -z | xargs -0 -I{} sed -i 's/\r$//' "{}"
+          echo "✓ Kernel clonado em ${KDIR}"
+
+      - name: Sanear Makefiles/Kconfig (CRLF/BOM/TAB)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${KDIR}"
+          # Pontos críticos conhecidos (ex.: focaltech):
+          for f in $(git ls-files 'drivers/input/touchscreen/**/Makefile' 2>/dev/null || true); do
+            sed -i 's/\r$//' "$f"
+          done
+          echo "✓ Makefiles/Kconfig saneados."
 
       - name: Compilar Kernel (defconfig + build)
         shell: bash
-        working-directory: ${{ env.KERNEL_DIR }}
-        env:
-          DEFCONFIG_NAME: ${{ env.DEFCONFIG_NAME }}  # já deve estar vindo do seu env
-          TOOLCHAIN: ${{ env.TOOLCHAIN }}
+        run: |
+          set -euo pipefail
+          cd "${KDIR}"
+
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export O="${OUT}"
+          mkdir -p "${OUT}"
+
+          # Se CLANG_TRIPLE foi fornecido no perfil, use como CROSS_COMPILE
+          if [[ -n "${CLANG_TRIPLE:-}" ]]; then
+            export CROSS_COMPILE="${CLANG_TRIPLE}"
+          fi
+
+          echo "-> Preparando O=out"
+          make -j"$(nproc)" O="${OUT}" "${DEFCONFIG_NAME}"
+
+          echo "-> Compilando"
+          make -j"$(nproc)" \
+            O="${OUT}" \
+            ARCH=arm64 \
+            LLVM="${LLVM:-1}" \
+            LLVM_IAS="${LLVM_IAS:-1}" \
+            CC="${CC:-clang}" \
+            LD="${LD:-ld.lld}"
+
+          # Captura candidatos a imagem
+          IMG=""
+          for c in \
+            "${OUT}/Image.gz-dtb" \
+            "${OUT}/Image.gz" \
+            "${OUT}/Image-dtb" \
+            "${OUT}/Image"; do
+            [[ -f "$c" ]] && IMG="$c" && break || true
+          done
+
+          [[ -n "${IMG}" ]] || { echo "::error::Nenhuma imagem de kernel encontrada em ${OUT}"; ls -lah "${OUT}"; exit 4; }
+
+          echo "KERNEL_IMAGE=${IMG}" >> $GITHUB_ENV
+
+          # opcional dtbo
+          if [[ -f "${OUT}/dtbo.img" ]]; then
+            echo "DTBO_IMAGE=${OUT}/dtbo.img" >> $GITHUB_ENV
+          fi
+
+          echo "✓ Build finalizado."
+
+      - name: Empacotar com AnyKernel3
+        shell: bash
         run: |
           set -euo pipefail
 
-          echo "→ Limpando out e preparando build"
-          mkdir -p out
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export KBUILD_BUILD_USER=runner
-          export KBUILD_BUILD_HOST=github
-          export PATH="${TOOLCHAIN}:${PATH}"
-
-          # Defconfig
-          make O=out ${DEFCONFIG_NAME}
-
-          # Ativar CONFIG_KSU=y na configuração final
-          echo 'CONFIG_KSU=y' > /tmp/ksu.config
-          if [[ -x scripts/kconfig/merge_config.sh ]]; then
-            scripts/kconfig/merge_config.sh -O out out/.config /tmp/ksu.config
-            make O=out olddefconfig
-          else
-            cat /tmp/ksu.config >> out/.config
-            yes "" | make O=out olddefconfig
+          if [[ -z "${KERNEL_IMAGE:-}" ]]; then
+            echo "::error::KERNEL_IMAGE não definido"
+            exit 5
           fi
 
-          # Compilar (ajuste -j conforme necessário)
-          make -j"$(nproc)" O=out
+          rm -rf "${AK3DIR}"
+          git clone --depth=1 -b "${AK3_BRANCH}" "${AK3_SOURCE}" "${AK3DIR}"
 
+          # Copia artefatos
+          cp -f "${KERNEL_IMAGE}" "${AK3DIR}/"
+          if [[ -n "${DTBO_IMAGE:-}" && -f "${DTBO_IMAGE}" ]]; then
+            cp -f "${DTBO_IMAGE}" "${AK3DIR}/"
+          fi
+
+          cd "${AK3DIR}"
+          ZIP="Kernel-${{ inputs.PROFILE_NAME }}-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "${ZIP}" . -x ".git*" -x "*.zip"
+          echo "AK3_ZIP=${AK3DIR}/${ZIP}" >> $GITHUB_ENV
+          echo "✓ AnyKernel3 pronto: ${ZIP}"
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-${{ inputs.PROFILE_NAME }}
+          path: |
+            ${{ env.AK3_ZIP }}
+            ${{ env.KERNEL_IMAGE }}
+            ${{ env.DTBO_IMAGE }}
+          if-no-files-found: error
+
+      # (Opcional) Release simples se habilitado
+      - name: Criar Release (opcional)
+        if: ${{ inputs.MAKE_RELEASE == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "kernel-${{ inputs.PROFILE_NAME }}-${{ github.run_number }}"
+          name: "Kernel ${{ inputs.PROFILE_NAME }} #${{ github.run_number }}"
+          files: |
+            ${{ env.AK3_ZIP }}
+            ${{ env.KERNEL_IMAGE }}
+            ${{ env.DTBO_IMAGE }}
