@@ -129,3 +129,101 @@ jobs:
           echo "✓ Ambiente pronto e variáveis do perfil carregadas com sucesso."
           echo "✓ Repositórios kernel/AK3 clonados (validação)."
           echo "Agora você pode adicionar os passos de build."
+
+      - name: Setup Clang (from profile CLANG_SOURCE)
+        run: |
+          set -euo pipefail
+          if [ -n "${CLANG_SOURCE:-}" ]; then
+            echo "Baixando Clang: ${CLANG_SOURCE}"
+            mkdir -p "$GITHUB_WORKSPACE/toolchains"
+            cd "$GITHUB_WORKSPACE/toolchains"
+            # Baixa e extrai
+            curl -L "${CLANG_SOURCE}" -o llvm.tar.xz
+            mkdir -p llvm
+            tar -xJf llvm.tar.xz -C llvm --strip-components=1
+            rm -f llvm.tar.xz
+            echo "$GITHUB_WORKSPACE/toolchains/llvm/bin" >> $GITHUB_PATH
+            echo "LLVM_HOME=$GITHUB_WORKSPACE/toolchains/llvm" >> "$GITHUB_ENV"
+          else
+            echo "CLANG_SOURCE vazio. Usando clang do sistema."
+            which clang || true
+          fi
+
+      - name: Export toolchains and build flags
+        run: |
+          set -euo pipefail
+          echo "ARCH=arm64" >> "$GITHUB_ENV"
+          echo "SUBARCH=arm64" >> "$GITHUB_ENV"
+
+          # CLANG_TRIPLE vindo do perfil (se não vier, define)
+          : "${CLANG_TRIPLE:=aarch64-linux-gnu-}"
+          echo "CLANG_TRIPLE=${CLANG_TRIPLE}" >> "$GITHUB_ENV"
+
+          # CROSS_COMPILE (64) e CROSS_COMPILE_ARM32 (32)
+          : "${CROSS_COMPILE:=aarch64-linux-gnu-}"
+          : "${CROSS_COMPILE_ARM32:=arm-linux-gnueabi-}"
+          echo "CROSS_COMPILE=${CROSS_COMPILE}" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32}" >> "$GITHUB_ENV"
+
+          # LLVM flags
+          echo "LLVM=1" >> "$GITHUB_ENV"
+          echo "LLVM_IAS=1" >> "$GITHUB_ENV"
+
+          # Saída O=out
+          echo "OUT_DIR=$GITHUB_WORKSPACE/out" >> "$GITHUB_ENV"
+
+      - name: Build defconfig
+        run: |
+          set -euo pipefail
+          cd device_kernel
+          make O="${OUT_DIR}" "${DEFCONFIG_NAME}" \
+            ARCH="${ARCH}" SUBARCH="${SUBARCH}" \
+            CC=clang LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" \
+            CLANG_TRIPLE="${CLANG_TRIPLE}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}"
+
+      - name: Compile kernel
+        run: |
+          set -euo pipefail
+          cd device_kernel
+          make -j"$(nproc)" O="${OUT_DIR}" \
+            ARCH="${ARCH}" SUBARCH="${SUBARCH}" \
+            CC=clang LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" \
+            CLANG_TRIPLE="${CLANG_TRIPLE}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}"
+
+          echo "Conteúdo de ${OUT_DIR}/arch/arm64/boot:"
+          ls -lah "${OUT_DIR}/arch/arm64/boot" || true
+
+      - name: Package into AnyKernel3
+        run: |
+          set -euo pipefail
+          BOOT_DIR="${OUT_DIR}/arch/arm64/boot"
+          KOUT=""
+          if [ -f "${BOOT_DIR}/Image.gz-dtb" ]; then
+            KOUT="${BOOT_DIR}/Image.gz-dtb"
+            cp -f "${BOOT_DIR}/Image.gz-dtb" AnyKernel3/Image.gz-dtb
+          elif [ -f "${BOOT_DIR}/Image.gz" ]; then
+            KOUT="${BOOT_DIR}/Image.gz"
+            cp -f "${BOOT_DIR}/Image.gz" AnyKernel3/Image.gz
+          elif [ -f "${BOOT_DIR}/Image" ]; then
+            KOUT="${BOOT_DIR}/Image"
+            cp -f "${BOOT_DIR}/Image" AnyKernel3/Image
+          else
+            echo "Nenhum artefato conhecido encontrado (Image.gz-dtb / Image.gz / Image)."
+            ls -lah "${BOOT_DIR}" || true
+            exit 1
+          fi
+          echo "Artefato do kernel: ${KOUT}"
+
+          ZIP_NAME="Kernel-star_hyper_a14-${{ github.run_id }}.zip"
+          (cd AnyKernel3 && zip -r9 "../${ZIP_NAME}" * -x .git* >/dev/null)
+          echo "ZIP_PATH=${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
