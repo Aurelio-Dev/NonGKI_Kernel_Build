@@ -34,23 +34,48 @@ jobs:
           python3 --version || true
           git --version
 
-      - name: Carregar perfil
-        id: load_env
-        run: |
-          set -euxo pipefail
-          test -f "Profiles/${PROFILE_NAME}"
-          echo "→ Perfil: Profiles/${PROFILE_NAME}"
-          # Exporta KEY=VALUE (sem espaços ao redor de '=') do .env para o ambiente do job
-          while IFS='=' read -r k v; do
-            case "$k" in ''|\#*) continue;; esac
-            v="${v%\"}"; v="${v#\"}"
-            echo "$k=$v" >> "$GITHUB_ENV"
-          done < "Profiles/${PROFILE_NAME}"
+            - name: Carregar perfil
+            
+          id: load_env
+          run: |
+            set -euxo pipefail
+  
+            # 1) Resolve o arquivo de perfil
+            PF="Profiles/${PROFILE_NAME}"
+            test -f "$PF"
+  
+            # Se o perfil tiver um ponteiro CONFIG_ENV=..., segue esse arquivo
+            # (ex.: CONFIG_ENV=Profiles/star_hyper_a14.env)
+            # Remove CRLF antes de ler, para evitar '\r' escondido no nome.
+            sed -i 's/\r$//' "$PF"
+            if grep -Eq '^[[:space:]]*CONFIG_ENV[[:space:]]*=' "$PF"; then
+              PF2="$(sed -n 's/^[[:space:]]*CONFIG_ENV[[:space:]]*=[[:space:]]*//p' "$PF" | head -n1 | tr -d '"'\'' )"
+              if [ -n "$PF2" ] && [ -f "$PF2" ]; then
+                PF="$PF2"
+              fi
+            fi
+  
+            echo "→ Perfil: $PF"
+  
+            # 2) Normaliza fim-de-linha (CRLF → LF) e aparas de espaços
+            sed -i 's/\r$//' "$PF"
+  
+            # 3) Exporta as variáveis do arquivo com segurança
+            #    (habilita export automático, 'sourça' o arquivo, desabilita export)
+            set -a
+            . "$PF"
+            set +a
+  
+            # 4) Guard-rails obrigatórios
+            : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
+            : "${KERNEL_BRANCH:?KERNEL_BRANCH não definido no perfil}"
+            : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
+  
+            # 5) (Opcional) log curto para debug
+            echo "KERNEL_SOURCE=$KERNEL_SOURCE"
+            echo "KERNEL_BRANCH=$KERNEL_BRANCH"
+            echo "DEFCONFIG_NAME=$DEFCONFIG_NAME"
 
-          # Guard-rails
-          test -n "${KERNEL_SOURCE:-}"   || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
-          test -n "${KERNEL_BRANCH:-}"   || { echo "::error::KERNEL_BRANCH não definido no perfil"; exit 3; }
-          test -n "${DEFCONFIG_NAME:-}"  || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 3; }
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
