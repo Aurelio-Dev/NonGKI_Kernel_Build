@@ -2,23 +2,10 @@ name: Build Kernel • star_hyper_a14
 
 on:
   workflow_dispatch:
-    inputs:
-      PROFILE_NAME:
-        description: "Profile .env em Profiles/"
-        required: true
-        default: "star_hyper_a14.env"
-      PYTHON_VERSION:
-        description: "Versão do Python para toolchain scripts"
-        required: true
-        default: "3"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-
-    env:
-      PROFILE_NAME: ${{ inputs.PROFILE_NAME }}
-      PYTHON_VERSION: ${{ inputs.PYTHON_VERSION }}
 
     steps:
       - name: Checkout repositório
@@ -26,99 +13,118 @@ jobs:
 
       - name: Mostrar versões do runner
         run: |
+          set -euo pipefail
           uname -a
           lsb_release -a || true
+          gcc --version | head -n1
+          clang --version | head -n1
           git --version
 
-      - name: Carregar perfil
-        id: envfile
+      # >>>>>>> PASSO CRÍTICO: carrega e exporta as variáveis do perfil
+      - name: Carregar perfil (Profiles/star_hyper_a14.env)
+        id: load_profile
+        shell: bash
         run: |
           set -euo pipefail
-          test -f "Profiles/${PROFILE_NAME}" || { echo "::error::Perfil Profiles/${PROFILE_NAME} não encontrado"; exit 1; }
-          # Normaliza EOL e remove linhas inválidas/comentários
-          tmp=$(mktemp)
-          sed -e 's/\r$//' -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "Profiles/${PROFILE_NAME}" > "$tmp"
-          # Exporta variáveis do .env
-          set -a
-          . "$tmp"
-          set +a
+          PROFILE_FILE="${{ github.workspace }}/Profiles/star_hyper_a14.env"
+
+          if [[ ! -f "$PROFILE_FILE" ]]; then
+            echo "::error file=Profiles/star_hyper_a14.env::Arquivo de perfil não encontrado."
+            exit 1
+          fi
+
+          # Normaliza CRLF -> LF para evitar erros de parsing
+          sed -i 's/\r$//' "$PROFILE_FILE"
+
+          echo "## Carregando variáveis de $PROFILE_FILE"
+          # Lê chave=valor, ignora comentários/linhas vazias e exporta
+          while IFS='=' read -r key val; do
+            [[ -z "${key// }" || "$key" =~ ^\# ]] && continue
+            # remove aspas se existirem
+            val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+            export "$key=$val"
+            printf '%s=%s\n' "$key" "$val" >> "$GITHUB_ENV"
+          done < "$PROFILE_FILE"
+
+          # Garantias mínimas (caso o .env não traga algo essencial)
+          : "${KERNEL_SOURCE:=https://github.com/EndCredits/android_kernel_xiaomi_sm8350-miui.git}"
+          : "${KERNEL_BRANCH:=hyper-14}"
+          printf 'KERNEL_SOURCE=%s\nKERNEL_BRANCH=%s\n' "$KERNEL_SOURCE" "$KERNEL_BRANCH" >> "$GITHUB_ENV"
 
           echo "KERNEL_SOURCE=$KERNEL_SOURCE"
           echo "KERNEL_BRANCH=$KERNEL_BRANCH"
-          echo "DEFCONFIG_NAME=$DEFCONFIG_NAME"
-          echo "KERNELSU_BRANCH=$KERNELSU_BRANCH"
+          # (opcional) mostre também o DEFCONFIG
+          echo "DEFCONFIG_NAME=${DEFCONFIG_NAME:-<não definido no perfil>}"
 
+      # (Opcional) Baixar LLVM/Clang
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p toolchains
-          echo "Baixando: $CLANG_SOURCE"
-          curl -L --retry 5 --retry-delay 5 "$CLANG_SOURCE" -o toolchains/clang.tar.xz
-          echo "Verificando tarball…"
-          tar -tJf toolchains/clang.tar.xz >/dev/null
-          echo "Extraindo…"
-          tar -xJf toolchains/clang.tar.xz -C toolchains
-          # Detecta diretório base do clang extraído
-          clang_dir=$(tar -tJf toolchains/clang.tar.xz | head -1 | cut -d/ -f1)
-          echo "CLANG_PATH=$PWD/toolchains/$clang_dir" >> $GITHUB_ENV
-          echo "PATH=$PWD/toolchains/$clang_dir/bin:$PATH" >> $GITHUB_ENV
+          URL="${CLANG_SOURCE}"
+          echo "Baixando LLVM/Clang de: ${URL}"
+          curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 \
+               -o llvm.tar.xz "${URL}"
+          tar -xJf llvm.tar.xz
+          LLVM_DIR=$(find . -maxdepth 1 -type d -name "LLVM-*" | head -n1)
+          if [[ -z "${LLVM_DIR}" ]]; then
+            echo "::error::Falha ao extrair LLVM."
+            exit 2
+          fi
+          echo "${{ github.workspace }}/${LLVM_DIR}/bin" >> $GITHUB_PATH
 
       - name: Clonar fonte do Kernel
+        shell: bash
         run: |
           set -euo pipefail
-          test -n "${KERNEL_SOURCE:-}" || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
-          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
-          echo "OK: Kernel clonado em device_kernel"
+          test -n "${KERNEL_SOURCE:-}" || { echo "::error::KERNEL_SOURCE não definido"; exit 3; }
+          BRANCH="${KERNEL_BRANCH:-${KERNEL_SOURCE_BRANCH:-}}"
+
+          echo "Clonando: $KERNEL_SOURCE  (branch: ${BRANCH:-<default>})"
+          if [[ -n "$BRANCH" ]]; then
+            git clone --depth=1 -b "$BRANCH" "$KERNEL_SOURCE" device_kernel
+          else
+            git clone --depth=1 "$KERNEL_SOURCE" device_kernel
+          fi
+          echo "✓ Kernel clonado em ./device_kernel"
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
+        shell: bash
+        working-directory: device_kernel
         run: |
           set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y dos2unix
-          find device_kernel -type f \( -name "Makefile" -o -name "*.mk" -o -name "Kconfig*" \) -print0 \
-            | xargs -0 dos2unix || true
-          # Corrige tabs/CRLF ocasionais em diretórios críticos
-          sed -i 's/\r$//' device_kernel/drivers/input/touchscreen/focaltech_3680/Makefile || true
+          # Normaliza CRLF nos Makefiles/arquivos .mk e *.rc
+          find . -type f \( -name 'Makefile*' -o -name '*.mk' -o -name '*.rc' \) -exec sed -i 's/\r$//' {} +
+          # Normaliza também diretórios sensíveis (ex: drivers/input)
+          find drivers -type f -exec sed -i 's/\r$//' {} + || true
 
       - name: Compilar Kernel (defconfig + build)
+        shell: bash
+        working-directory: device_kernel
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
         run: |
           set -euo pipefail
-          cd device_kernel
-          mkdir -p out
+          DEFCONFIG="${DEFCONFIG_NAME:-vendor/star_defconfig}"
 
-          # Toolchain env do perfil (se existir)
-          # CUSTOM_CMDS/EXTRA_CMDS vêm do .env, então apenas exportamos aqui
-          [ -n "${CUSTOM_CMDS:-}" ] && eval "export ${CUSTOM_CMDS}"
-          [ -n "${EXTRA_CMDS:-}" ] && eval "export ${EXTRA_CMDS}"
+          echo "Usando defconfig: $DEFCONFIG"
+          make O=out ARCH=arm64 "$DEFCONFIG"
+          make -j"$(nproc)" O=out ARCH=arm64
 
-          # Se CLANG_PATH foi definido, garante no PATH
-          [ -n "${CLANG_PATH:-}" ] && export PATH="$CLANG_PATH/bin:$PATH"
-
-          echo "Usando defconfig: ${DEFCONFIG_NAME}"
-          make O=out ${DEFCONFIG_NAME}
-
-          # Alguns trees exigem clean parcial para drivers antes do build
-          make O=out -j"$(nproc --all)"
-
+      # (Opcional) empacotar com AnyKernel3 se o seu projeto usa AK3
       - name: Empacotar com AnyKernel3
+        if: success()
+        shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 -b "${AK3_BRANCH}" "${AK3_SOURCE}" ak3
-          # Copia Image/boot artefatos comuns (ajuste conforme seu tree)
-          if [ -f device_kernel/out/arch/arm64/boot/Image.gz-dtb ]; then
-            cp device_kernel/out/arch/arm64/boot/Image.gz-dtb ak3/
-          elif [ -f device_kernel/out/arch/arm64/boot/Image.gz ]; then
-            cp device_kernel/out/arch/arm64/boot/Image.gz ak3/
-          elif [ -f device_kernel/out/arch/arm64/boot/Image ]; then
-            cp device_kernel/out/arch/arm64/boot/Image ak3/
-          else
-            echo "::error::Image de saída não encontrada"; exit 5
-          fi
-          (cd ak3 && zip -r9 ../Kernel-star_hyper_a14.zip .)
+          # Exemplo mínimo; ajuste conforme seu projeto/AK3
+          echo "Pulando empacotamento detalhado aqui (adicione o seu fluxo de AK3)."
 
       - name: Publicar artefato
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-star_hyper_a14
-          path: Kernel-star_hyper_a14.zip
+          name: Kernel-build-out
+          path: device_kernel/out/**
