@@ -41,59 +41,18 @@ jobs:
           test -f "Profiles/${PROFILE_NAME}"
           echo "→ Perfil: Profiles/${PROFILE_NAME}"
 
-          # Exporta variáveis KEY=VALUE (ignora vazias/comentários)
+          # Carrega somente linhas do tipo KEY=VALUE (ignorando comentários e espaços)
           while IFS='=' read -r k v; do
             case "$k" in ''|\#*) continue;; esac
-            # remove aspas simples/duplas nas extremidades
+            k="$(printf '%s' "$k" | sed 's/[[:space:]]//g')"
             v="${v%\"}"; v="${v#\"}"
-            v="${v%\'}"; v="${v#\'}"
             echo "$k=$v" >> "$GITHUB_ENV"
-            export "$k=$v"
           done < "Profiles/${PROFILE_NAME}"
 
-          # -------------------------------------------------------
-          #  Mapas de compatibilidade (aliases do seu .env)
-          # -------------------------------------------------------
-          # KERNEL_SOURCE
-          if [ -z "${KERNEL_SOURCE:-}" ]; then
-            for alt in KERNEL_REPO KERNEL_GIT KERNEL_URL KERNEL_SOURCE_URL SOURCE_URL; do
-              eval _val="\${$alt:-}"
-              if [ -n "$_val" ]; then
-                echo "KERNEL_SOURCE=$_val" >> "$GITHUB_ENV"
-                export KERNEL_SOURCE="$_val"
-                break
-              fi
-            done
-          fi
-
-          # KERNEL_BRANCH
-          if [ -z "${KERNEL_BRANCH:-}" ]; then
-            for alt in BRANCH KERNEL_SOURCE_BRANCH KERNEL_BRANCH_NAME SOURCE_BRANCH; do
-              eval _val="\${$alt:-}"
-              if [ -n "$_val" ]; then
-                echo "KERNEL_BRANCH=$_val" >> "$GITHUB_ENV"
-                export KERNEL_BRANCH="$_val"
-                break
-              fi
-            done
-          fi
-
-          # DEFCONFIG_NAME
-          if [ -z "${DEFCONFIG_NAME:-}" ]; then
-            for alt in DEFCONFIG KERNEL_DEFCONFIG; do
-              eval _val="\${$alt:-}"
-              if [ -n "$_val" ]; then
-                echo "DEFCONFIG_NAME=$_val" >> "$GITHUB_ENV"
-                export DEFCONFIG_NAME="$_val"
-                break
-              fi
-            done
-          fi
-
-          # Guard-rails (agora só após compat)
-          test -n "${KERNEL_SOURCE:-}"   || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
-          test -n "${KERNEL_BRANCH:-}"   || { echo "::error::KERNEL_BRANCH não definido no perfil"; exit 3; }
-          test -n "${DEFCONFIG_NAME:-}"  || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 3; }
+          # Guard-rails
+          test -n "${KERNEL_SOURCE:-}"  || { echo "::error::KERNEL_SOURCE não definido no perfil";  exit 3; }
+          test -n "${KERNEL_BRANCH:-}"  || { echo "::error::KERNEL_BRANCH não definido no perfil";  exit 3; }
+          test -n "${DEFCONFIG_NAME:-}" || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 3; }
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -115,7 +74,7 @@ jobs:
           sudo apt-get install -y build-essential bc bison flex libssl-dev \
               libelf-dev ccache python3 python2 curl git rsync lz4 \
               gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-"   >> $GITHUB_ENV
           echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
 
       - name: Clonar fonte do Kernel
@@ -127,32 +86,39 @@ jobs:
           echo "KERNEL_TREE=$(pwd)" >> $GITHUB_ENV
 
       # ---------------------------------------------------------
-      #  KernelSU com fallback de diretório + geração via printf
+      #  KernelSU — injeção robusta
+      #  - escolhe base (drivers/ ou drivers/misc/)
+      #  - lida com conflito se existir ARQUIVO com o nome 'kernelsu'
+      #  - garante Makefile/Kconfig mínimos sem quebrar o YAML
+      #  - inclui no Kconfig/Makefile corretos
       # ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
 
-          # Escolhe caminho seguro
-          KS_DIR=""
-          for cand in drivers/kernelsu drivers/ksu drivers/misc/kernelsu; do
-            if [ -e "$cand" ] && [ ! -d "$cand" ]; then
-              continue
-            fi
-            KS_DIR="$cand"
-            break
-          done
-          [ -n "$KS_DIR" ] || { echo "::error::Não foi possível definir diretório para KernelSU"; exit 2; }
+          # Base onde o subdiretório ficará
+          if [ -d drivers/misc ]; then
+            BASE_DIR="drivers/misc"
+          else
+            BASE_DIR="drivers"
+          fi
+          KS_DIR="$BASE_DIR/kernelsu"
+
+          # Se houver um ARQUIVO com esse nome, renomeia; depois cria diretório
+          if [ -f "$KS_DIR" ]; then
+            mv -v "$KS_DIR" "${KS_DIR}.bak.$(date +%s)"
+          fi
           mkdir -p "$KS_DIR"
 
-          # Clona uma vez e injeta
-          if [ ! -d /tmp/KernelSU ]; then
-            git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git /tmp/KernelSU
+          # Só clona/copias se ainda não existir conteúdo
+          if [ ! -f "$KS_DIR/Kconfig" ] || [ ! -f "$KS_DIR/Makefile" ]; then
+            tmpdir="$(mktemp -d)"
+            git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git "$tmpdir/ksu"
+            cp -av "$tmpdir/ksu/kernel/"* "$KS_DIR"/ || true
           fi
-          rsync -a --ignore-existing /tmp/KernelSU/kernel/ "$KS_DIR/"
 
-          # Makefile mínimo (via printf para não quebrar YAML)
+          # Makefile mínimo
           if [ ! -s "$KS_DIR/Makefile" ]; then
             printf '%s\n' \
               'obj-$(CONFIG_KSU) += ksu.o' \
@@ -171,16 +137,19 @@ jobs:
               > "$KS_DIR/Kconfig"
           fi
 
-          # Entradas em drivers/Kconfig e drivers/Makefile (idempotente)
-          if [[ "$KS_DIR" == drivers/* ]]; then
-            if ! grep -q "source \"$KS_DIR/Kconfig\"" drivers/Kconfig; then
-              echo "source \"$KS_DIR/Kconfig\"" >> drivers/Kconfig
-            fi
-            modname="$(basename "$KS_DIR")"
-            if ! grep -q "obj-\\$(CONFIG_KSU).*+=.*${modname}/" drivers/Makefile; then
-              echo "obj-\$(CONFIG_KSU) += ${modname}/" >> drivers/Makefile
-            fi
+          # Inclui no Kconfig do diretório-pai (drivers OU drivers/misc)
+          PARENT_KCONF="$BASE_DIR/Kconfig"
+          if ! grep -q 'kernelsu/Kconfig' "$PARENT_KCONF" 2>/dev/null; then
+            echo "source \"${KS_DIR}/Kconfig\"" >> "$PARENT_KCONF"
           fi
+
+          # Inclui no Makefile do diretório-pai
+          PARENT_MKF="$BASE_DIR/Makefile"
+          if ! grep -q 'kernelsu/' "$PARENT_MKF" 2>/dev/null; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> "$PARENT_MKF"
+          fi
+
+          echo "KSU_DIR=$KS_DIR" >> $GITHUB_ENV
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
@@ -225,7 +194,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           rm -rf AnyKernel3
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
-          cp -av out/* AnyKernel3/
+          cp -av out/* AnyKernel3/ || true
           cd AnyKernel3
           zip -r9 "$GITHUB_WORKSPACE/Kernel-star_hyper_a14-$(date +%Y%m%d-%H%M).zip" ./
 
