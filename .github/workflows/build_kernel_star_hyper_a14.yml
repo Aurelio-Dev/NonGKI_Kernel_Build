@@ -41,14 +41,56 @@ jobs:
           test -f "Profiles/${PROFILE_NAME}"
           echo "→ Perfil: Profiles/${PROFILE_NAME}"
 
-          # Exporta as variáveis do .env
+          # Exporta variáveis KEY=VALUE (ignora vazias/comentários)
           while IFS='=' read -r k v; do
             case "$k" in ''|\#*) continue;; esac
+            # remove aspas simples/duplas nas extremidades
             v="${v%\"}"; v="${v#\"}"
+            v="${v%\'}"; v="${v#\'}"
             echo "$k=$v" >> "$GITHUB_ENV"
+            export "$k=$v"
           done < "Profiles/${PROFILE_NAME}"
 
-          # Guard-rails
+          # -------------------------------------------------------
+          #  Mapas de compatibilidade (aliases do seu .env)
+          # -------------------------------------------------------
+          # KERNEL_SOURCE
+          if [ -z "${KERNEL_SOURCE:-}" ]; then
+            for alt in KERNEL_REPO KERNEL_GIT KERNEL_URL KERNEL_SOURCE_URL SOURCE_URL; do
+              eval _val="\${$alt:-}"
+              if [ -n "$_val" ]; then
+                echo "KERNEL_SOURCE=$_val" >> "$GITHUB_ENV"
+                export KERNEL_SOURCE="$_val"
+                break
+              fi
+            done
+          fi
+
+          # KERNEL_BRANCH
+          if [ -z "${KERNEL_BRANCH:-}" ]; then
+            for alt in BRANCH KERNEL_SOURCE_BRANCH KERNEL_BRANCH_NAME SOURCE_BRANCH; do
+              eval _val="\${$alt:-}"
+              if [ -n "$_val" ]; then
+                echo "KERNEL_BRANCH=$_val" >> "$GITHUB_ENV"
+                export KERNEL_BRANCH="$_val"
+                break
+              fi
+            done
+          fi
+
+          # DEFCONFIG_NAME
+          if [ -z "${DEFCONFIG_NAME:-}" ]; then
+            for alt in DEFCONFIG KERNEL_DEFCONFIG; do
+              eval _val="\${$alt:-}"
+              if [ -n "$_val" ]; then
+                echo "DEFCONFIG_NAME=$_val" >> "$GITHUB_ENV"
+                export DEFCONFIG_NAME="$_val"
+                break
+              fi
+            done
+          fi
+
+          # Guard-rails (agora só após compat)
           test -n "${KERNEL_SOURCE:-}"   || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
           test -n "${KERNEL_BRANCH:-}"   || { echo "::error::KERNEL_BRANCH não definido no perfil"; exit 3; }
           test -n "${DEFCONFIG_NAME:-}"  || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 3; }
@@ -92,7 +134,7 @@ jobs:
           set -euxo pipefail
           cd "$KERNEL_TREE"
 
-          # Escolhe caminho seguro (evita 'File exists' se houver arquivo)
+          # Escolhe caminho seguro
           KS_DIR=""
           for cand in drivers/kernelsu drivers/ksu drivers/misc/kernelsu; do
             if [ -e "$cand" ] && [ ! -d "$cand" ]; then
@@ -102,16 +144,15 @@ jobs:
             break
           done
           [ -n "$KS_DIR" ] || { echo "::error::Não foi possível definir diretório para KernelSU"; exit 2; }
-
           mkdir -p "$KS_DIR"
 
-          # Clona uma vez
+          # Clona uma vez e injeta
           if [ ! -d /tmp/KernelSU ]; then
             git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git /tmp/KernelSU
           fi
           rsync -a --ignore-existing /tmp/KernelSU/kernel/ "$KS_DIR/"
 
-          # Makefile mínimo (via printf — evita YAML quebrar por causa de ':')
+          # Makefile mínimo (via printf para não quebrar YAML)
           if [ ! -s "$KS_DIR/Makefile" ]; then
             printf '%s\n' \
               'obj-$(CONFIG_KSU) += ksu.o' \
@@ -119,7 +160,7 @@ jobs:
               > "$KS_DIR/Makefile"
           fi
 
-          # Kconfig mínimo (via printf)
+          # Kconfig mínimo
           if [ ! -s "$KS_DIR/Kconfig" ]; then
             printf '%s\n' \
               'config KSU' \
@@ -130,7 +171,7 @@ jobs:
               > "$KS_DIR/Kconfig"
           fi
 
-          # Entradas nos arquivos de drivers (idempotente)
+          # Entradas em drivers/Kconfig e drivers/Makefile (idempotente)
           if [[ "$KS_DIR" == drivers/* ]]; then
             if ! grep -q "source \"$KS_DIR/Kconfig\"" drivers/Kconfig; then
               echo "source \"$KS_DIR/Kconfig\"" >> drivers/Kconfig
