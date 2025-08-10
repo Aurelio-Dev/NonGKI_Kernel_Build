@@ -101,46 +101,61 @@ jobs:
       #  BLOCO KernelSU — robusto contra diretório existente
       #  (não falha se drivers/kernelsu já existir)
       # ---------------------------------------------------------
-     # ---------------------------------------------------------
-#  BLOCO KernelSU — robusto (idempotente e com validações)
-# ---------------------------------------------------------
+  # ---------------------------------------------------------
+      #  KernelSU: injeta no tree e lida com ausência de SuSFS
+      # ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
 
-          KS_DIR="drivers/kernelsu"
-          BR="${KERNELSU_BRANCH:-susfs-main}"
-          REPO="${KERNELSU_SOURCE:-https://github.com/rsuntk/KernelSU.git}"
+          # Variáveis vindas do perfil (.env)
+          SRC_DEFAULT="${KERNELSU_SOURCE:-https://github.com/backslashxx/KernelSU.git}"
+          BR_DEFAULT="${KERNELSU_BRANCH:-master}"   # master == “Magic”
+          FORCE_SUSFS="${FORCE_SUSFS:-false}"
 
-          echo "→ Origem do KernelSU: $REPO"
-          echo "→ Branch solicitada:  $BR"
-
-          # 🔎 Verifica se a branch existe no remoto; se não, cai para 'susfs-main'
-          if git ls-remote --heads "$REPO" "$BR" | grep -q .; then
-            echo "✓ Branch '$BR' existe no remoto."
-          else
-            echo "⚠️  Branch '$BR' não existe em $REPO — usando 'susfs-main'."
-            BR="susfs-main"
+          # 1) Detecta SuSFS no kernel base
+          HAS_SUSFS=false
+          if [ -d fs/susfs ] || git grep -q "^config[[:space:]]\+SUSFS" -- Kconfig\* fs/Kconfig 2>/dev/null || \
+             grep -Rqs "CONFIG_SUSFS" . ; then
+            HAS_SUSFS=true
           fi
 
-          # Limpa qualquer coisa existente e recria diretório de destino
-          rm -rf "$KS_DIR"
+          # 2) Decide qual fonte/branch do KSU usar
+          KSU_SRC="$SRC_DEFAULT"
+          KSU_BR="$BR_DEFAULT"
+
+          if [ "$FORCE_SUSFS" = "true" ]; then
+            echo "⚠ FORCING SuSFS branch via FORCE_SUSFS=true"
+          else
+            if [ "$HAS_SUSFS" = "true" ]; then
+              echo " SuSFS detectado no kernel — mantendo $KSU_SRC ($KSU_BR)"
+            else
+              echo "::warning:: SuSFS não encontrado no kernel. Alternando para KernelSU 'Magic' (sem SuSFS) para permitir a compilação."
+              KSU_SRC="https://github.com/backslashxx/KernelSU.git"
+              KSU_BR="master"
+            fi
+          fi
+
+          # 3) Garante destino limpo e clona o KSU
+          KS_DIR="drivers/kernelsu"
+          rm -rf "$KS_DIR"              # limpa arquivo/link/diretório antigo
           mkdir -p "$KS_DIR"
 
-          # Clona os fontes e copia pro destino
           rm -rf /tmp/KernelSU
-          git clone --depth=1 -b "$BR" "$REPO" /tmp/KernelSU
+          git clone --depth=1 -b "$KSU_BR" "$KSU_SRC" /tmp/KernelSU
+
+          # 4) Copia o conteúdo do diretório 'kernel' do KSU
           cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
 
-          # Garante include no Kconfig/Makefile do kernel (sem duplicar)
+          # 5) Garante integração no tree principal
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
 
           grep -q 'obj-$(CONFIG_KSU)      += kernelsu/' drivers/Makefile || \
             echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
 
-          echo "→ KernelSU injetado com sucesso."
+          echo "→ KernelSU injetado: $KSU_SRC ($KSU_BR)"
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
