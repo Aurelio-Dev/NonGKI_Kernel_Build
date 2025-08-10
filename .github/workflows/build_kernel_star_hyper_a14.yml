@@ -40,31 +40,17 @@ jobs:
           set -euxo pipefail
           test -f "Profiles/${PROFILE_NAME}"
           echo "→ Perfil: Profiles/${PROFILE_NAME}"
-
-          # Normaliza CRLF -> LF para evitar chaves com '\r'
-          sed -i 's/\r$//' "Profiles/${PROFILE_NAME}"
-
-          # Lê KEY=VALUE, ignora vazias e comentários, exporta AGORA
+          # Exporta KEY=VALUE (sem espaços ao redor de '=') do .env para o ambiente do job
           while IFS='=' read -r k v; do
-            # pula linhas vazias/comentário
-            [ -z "${k}" ] && continue
-            case "$k" in \#*) continue;; esac
-            # remove aspas ao redor, se houver
+            case "$k" in ''|\#*) continue;; esac
             v="${v%\"}"; v="${v#\"}"
-            # exporta para ESTE passo
-            export "$k=$v"
-            # e para os próximos passos
             echo "$k=$v" >> "$GITHUB_ENV"
           done < "Profiles/${PROFILE_NAME}"
 
-          # Guard-rails (agora visíveis porque exportamos)
+          # Guard-rails
           test -n "${KERNEL_SOURCE:-}"   || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
           test -n "${KERNEL_BRANCH:-}"   || { echo "::error::KERNEL_BRANCH não definido no perfil"; exit 3; }
           test -n "${DEFCONFIG_NAME:-}"  || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 3; }
-          
-          # Defaults seguros para o KernelSU (se o .env não trouxer)
-          echo "KERNELSU_SOURCE=${KERNELSU_SOURCE:-https://github.com/rsuntk/KernelSU.git}" >> "$GITHUB_ENV"
-          echo "KERNELSU_BRANCH=${KERNELSU_BRANCH:-susfs-main}" >> "$GITHUB_ENV"
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -98,64 +84,34 @@ jobs:
           echo "KERNEL_TREE=$(pwd)" >> $GITHUB_ENV
 
       # ---------------------------------------------------------
-      #  BLOCO KernelSU — robusto contra diretório existente
-      #  (não falha se drivers/kernelsu já existir)
-      # ---------------------------------------------------------
-  # ---------------------------------------------------------
-      #  KernelSU: injeta no tree e lida com ausência de SuSFS
+      #  BLOCO KernelSU • robusto contra dir/arquivo existente
       # ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
 
-          # Variáveis vindas do perfil (.env)
-          SRC_DEFAULT="${KERNELSU_SOURCE:-https://github.com/backslashxx/KernelSU.git}"
-          BR_DEFAULT="${KERNELSU_BRANCH:-master}"   # master == “Magic”
-          FORCE_SUSFS="${FORCE_SUSFS:-false}"
-
-          # 1) Detecta SuSFS no kernel base
-          HAS_SUSFS=false
-          if [ -d fs/susfs ] || git grep -q "^config[[:space:]]\+SUSFS" -- Kconfig\* fs/Kconfig 2>/dev/null || \
-             grep -Rqs "CONFIG_SUSFS" . ; then
-            HAS_SUSFS=true
-          fi
-
-          # 2) Decide qual fonte/branch do KSU usar
-          KSU_SRC="$SRC_DEFAULT"
-          KSU_BR="$BR_DEFAULT"
-
-          if [ "$FORCE_SUSFS" = "true" ]; then
-            echo "⚠ FORCING SuSFS branch via FORCE_SUSFS=true"
-          else
-            if [ "$HAS_SUSFS" = "true" ]; then
-              echo " SuSFS detectado no kernel — mantendo $KSU_SRC ($KSU_BR)"
-            else
-              echo "::warning:: SuSFS não encontrado no kernel. Alternando para KernelSU 'Magic' (sem SuSFS) para permitir a compilação."
-              KSU_SRC="https://github.com/backslashxx/KernelSU.git"
-              KSU_BR="master"
-            fi
-          fi
-
-          # 3) Garante destino limpo e clona o KSU
           KS_DIR="drivers/kernelsu"
-          rm -rf "$KS_DIR"              # limpa arquivo/link/diretório antigo
+
+          # Limpa qualquer entrada preexistente (arquivo/dir/symlink)
+          rm -rf "$KS_DIR"
           mkdir -p "$KS_DIR"
 
-          rm -rf /tmp/KernelSU
-          git clone --depth=1 -b "$KSU_BR" "$KSU_SRC" /tmp/KernelSU
+          : "${KERNELSU_SOURCE:=https://github.com/rsuntk/KernelSU.git}"
+          : "${KERNELSU_BRANCH:=susfs-main}"
 
-          # 4) Copia o conteúdo do diretório 'kernel' do KSU
+          # Clona KernelSU e copia apenas o /kernel
+          rm -rf /tmp/KernelSU
+          git clone --depth=1 -b "${KERNELSU_BRANCH}" "${KERNELSU_SOURCE}" /tmp/KernelSU
           cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
 
-          # 5) Garante integração no tree principal
+          # Garante include no drivers/Kconfig (idempotente)
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
 
+          # Garante entrada em drivers/Makefile (idempotente)
           grep -q 'obj-$(CONFIG_KSU)      += kernelsu/' drivers/Makefile || \
             echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
-
-          echo "→ KernelSU injetado: $KSU_SRC ($KSU_BR)"
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
@@ -163,6 +119,36 @@ jobs:
           cd "$KERNEL_TREE"
           find . -type f \( -name "Makefile" -o -name "Kconfig" -o -name "*.mk" -o -name "*.cfg" \) \
             -print0 | xargs -0 sed -i 's/\r$//'
+
+      # ---------------------------------------------------------
+      #  HOTFIX: include relativo + include-path (millet binder_gki)
+      # ---------------------------------------------------------
+      - name: Hotfix:binder_gki.c include path (millet)
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_TREE"
+
+          FILE="drivers/mihw/millet/binder_gki.c"
+          if [ -f "$FILE" ]; then
+            if grep -qE '#include <\.\./\.\./android/binder_internal\.h>' "$FILE"; then
+              sed -i 's@#include <\.\./\.\./android/binder_internal\.h>@#include "../../android/binder_internal.h"@' "$FILE"
+              echo "✔ Troca de include em $FILE aplicada."
+            fi
+          fi
+
+          MOD_MK="drivers/mihw/millet/Makefile"
+          if [ -f "$MOD_MK" ]; then
+            if ! grep -q 'ccflags-y.*drivers/android' "$MOD_MK"; then
+              echo 'ccflags-y += -I$(srctree)/drivers/android' >> "$MOD_MK"
+              echo "✔ Include-path adicionado em $MOD_MK."
+            fi
+          fi
+
+          # Confirma existência do header esperado
+          test -f drivers/android/binder_internal.h || {
+            echo "::error::drivers/android/binder_internal.h não encontrado no tree do kernel."
+            exit 2
+          }
 
       - name: Compilar Kernel (defconfig + build)
         run: |
@@ -174,15 +160,18 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
 
-          make -j"$(nproc)" "${DEFCONFIG_NAME}"
+          # defconfig
+          make -j$(nproc) "${DEFCONFIG_NAME}"
 
-          make -j"$(nproc)" \
+          # build
+          make -j$(nproc) \
             ${LLVM:+LLVM=1} \
             ${LLVM_IAS:+LLVM_IAS=1} \
             ${LD:+LD=$LD} \
             ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
             ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
 
+          # artefatos (coleta o que existir)
           mkdir -p "$GITHUB_WORKSPACE/out"
           for f in \
             arch/arm64/boot/Image.gz-dtb \
