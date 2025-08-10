@@ -4,251 +4,121 @@ on:
   workflow_dispatch:
     inputs:
       PROFILE_NAME:
-        description: "Nome do perfil em Profiles/ (ex.: star_hyper_a14)"
+        description: "Profile .env em Profiles/"
         required: true
-        default: "star_hyper_a14"
-      MAKE_RELEASE:
-        description: "Publicar release?"
-        required: false
-        type: boolean
-        default: false
+        default: "star_hyper_a14.env"
+      PYTHON_VERSION:
+        description: "Versão do Python para toolchain scripts"
+        required: true
+        default: "3"
 
 jobs:
   build:
-    name: build
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
 
     env:
-      # Pastas padrão
-      WORKDIR: ${{ github.workspace }}
-      KDIR:    ${{ github.workspace }}/device_kernel
-      OUT:     ${{ github.workspace }}/device_kernel/out
-      CLANGDIR:${{ github.workspace }}/clang
-      AK3DIR:  ${{ github.workspace }}/AnyKernel3
-      PROFILE: ${{ inputs.PROFILE_NAME }}
+      PROFILE_NAME: ${{ inputs.PROFILE_NAME }}
+      PYTHON_VERSION: ${{ inputs.PYTHON_VERSION }}
 
     steps:
-      - name: Checkout (este repositório)
+      - name: Checkout repositório
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Garantir ferramentas básicas
+      - name: Mostrar versões do runner
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ca-certificates ccache curl dos2unix \
-            flex git gzip libssl-dev lld llvm lz4 make python3 rsync tar \
-            unzip xz-utils zip zstd
+          uname -a
+          lsb_release -a || true
+          git --version
 
-      - name: Carregar perfil e exportar variáveis
-        id: load_profile
-        shell: bash
+      - name: Carregar perfil
+        id: envfile
         run: |
           set -euo pipefail
+          test -f "Profiles/${PROFILE_NAME}" || { echo "::error::Perfil Profiles/${PROFILE_NAME} não encontrado"; exit 1; }
+          # Normaliza EOL e remove linhas inválidas/comentários
+          tmp=$(mktemp)
+          sed -e 's/\r$//' -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "Profiles/${PROFILE_NAME}" > "$tmp"
+          # Exporta variáveis do .env
+          set -a
+          . "$tmp"
+          set +a
 
-          PF="Profiles/${PROFILE}.env"
-          echo "-> Perfil: ${PF}"
-          test -f "${PF}" || { echo "::error::Perfil não encontrado: ${PF}"; exit 2; }
+          echo "KERNEL_SOURCE=$KERNEL_SOURCE"
+          echo "KERNEL_BRANCH=$KERNEL_BRANCH"
+          echo "DEFCONFIG_NAME=$DEFCONFIG_NAME"
+          echo "KERNELSU_BRANCH=$KERNELSU_BRANCH"
 
-          # Converte linhas "CHAVE:VALOR" para "export CHAVE='VALOR'"
-          # Mantém linhas no formato shell "VAR=valor" também.
-          TMP="${WORKDIR}/_profile_export.sh"
-          {
-            echo "set -euo pipefail"
-            echo "# exporta pares CHAVE:VALOR"
-            awk -F':' '/^[A-Za-z0-9_]+:/{k=$1; $1=""; sub(/^:/,""); v=$0; gsub(/^ +| +$/,"",v); printf("export %s=\"%s\"\n",k,v)}' "${PF}"
-            echo "# exporta VAR=VALOR (shell)"
-            awk -F'=' '/^[A-Za-z0-9_]+=/{print "export "$1"=\""substr($0,index($0,"=")+1)"\""}' "${PF}"
-          } > "${TMP}"
-
-          bash "${TMP}"
-
-          # Confere obrigatórios
-          : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
-          : "${KERNEL_BRANCH:?KERNEL_BRANCH não definido no perfil}"
-          : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
-
-          # Expõe a outros steps via GITHUB_ENV
-          {
-            echo "KERNEL_SOURCE=${KERNEL_SOURCE}"
-            echo "KERNEL_BRANCH=${KERNEL_BRANCH}"
-            echo "DEFCONFIG_NAME=${DEFCONFIG_NAME}"
-            echo "AK3_SOURCE=${AK3_SOURCE:-https://github.com/osm0sis/AnyKernel3.git}"
-            echo "AK3_BRANCH=${AK3_BRANCH:-master}"
-            echo "CLANG_SOURCE=${CLANG_SOURCE:-https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-Linux-X64.tar.xz}"
-            echo "CLANG_TRIPLE=${CLANG_TRIPLE:-aarch64-linux-gnu-}"
-          } >> "$GITHUB_ENV"
-
-          echo "✓ Ambiente pronto e variáveis do perfil carregadas com sucesso."
-
-      - name: (Opcional) Baixar e preparar LLVM/Clang do perfil
-        shell: bash
+      - name: (Opcional) Baixar LLVM/Clang do perfil
+        if: ${{ env.CLANG_SOURCE != '' }}
         run: |
           set -euo pipefail
-          echo "Baixando LLVM/Clang de: ${CLANG_SOURCE}"
-
-          mkdir -p "${CLANGDIR}"
-          TARBALL="${WORKDIR}/clang.tar.xz"
-
-          # Tenta baixar com retry/restart
-          if ! curl -L --retry 3 --retry-delay 3 -C - "${CLANG_SOURCE}" -o "${TARBALL}"; then
-            echo "::warning::Falha no download do LLVM. Usando fallback via apt."
-            sudo apt-get update
-            sudo apt-get install -y clang-16 lld-16 llvm-16
-            echo "${WORKDIR}/clang-apt" >> $GITHUB_PATH
-            {
-              echo "CC=clang-16"
-              echo "LD=ld.lld-16"
-              echo "LLVM=1"
-              echo "LLVM_IAS=1"
-            } >> $GITHUB_ENV
-          else
-            # Extrai clang tarball, se falhar -> fallback apt
-            if ! tar -xJf "${TARBALL}" -C "${CLANGDIR}" --strip-components=1; then
-              echo "::warning::Falha ao extrair LLVM. Usando fallback via apt."
-              sudo apt-get update
-              sudo apt-get install -y clang-16 lld-16 llvm-16
-              echo "${WORKDIR}/clang-apt" >> $GITHUB_PATH
-              {
-                echo "CC=clang-16"
-                echo "LD=ld.lld-16"
-                echo "LLVM=1"
-                echo "LLVM_IAS=1"
-              } >> $GITHUB_ENV
-            else
-              echo "${CLANGDIR}/bin" >> $GITHUB_PATH
-              {
-                echo "CC=clang"
-                echo "LD=ld.lld"
-                echo "LLVM=1"
-                echo "LLVM_IAS=1"
-              } >> $GITHUB_ENV
-            fi
-          fi
-
-          echo "✓ LLVM/Clang pronto."
+          mkdir -p toolchains
+          echo "Baixando: $CLANG_SOURCE"
+          curl -L --retry 5 --retry-delay 5 "$CLANG_SOURCE" -o toolchains/clang.tar.xz
+          echo "Verificando tarball…"
+          tar -tJf toolchains/clang.tar.xz >/dev/null
+          echo "Extraindo…"
+          tar -xJf toolchains/clang.tar.xz -C toolchains
+          # Detecta diretório base do clang extraído
+          clang_dir=$(tar -tJf toolchains/clang.tar.xz | head -1 | cut -d/ -f1)
+          echo "CLANG_PATH=$PWD/toolchains/$clang_dir" >> $GITHUB_ENV
+          echo "PATH=$PWD/toolchains/$clang_dir/bin:$PATH" >> $GITHUB_ENV
 
       - name: Clonar fonte do Kernel
-        shell: bash
         run: |
           set -euo pipefail
-          test -n "${KERNEL_SOURCE}" || { echo "::error::KERNEL_SOURCE vazio"; exit 3; }
-          test -n "${KERNEL_BRANCH}" || { echo "::error::KERNEL_BRANCH vazio"; exit 3; }
+          test -n "${KERNEL_SOURCE:-}" || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
+          echo "OK: Kernel clonado em device_kernel"
 
-          rm -rf "${KDIR}"
-          git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_SOURCE}" "${KDIR}"
-
-          # Normaliza CRLF → LF para evitar "missing separator" em Makefiles
-          cd "${KDIR}"
-          git ls-files -z | xargs -0 -I{} sed -i 's/\r$//' "{}"
-          echo "✓ Kernel clonado em ${KDIR}"
-
-      - name: Sanear Makefiles/Kconfig (CRLF/BOM/TAB)
-        shell: bash
+      - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
           set -euo pipefail
-          cd "${KDIR}"
-          # Pontos críticos conhecidos (ex.: focaltech):
-          for f in $(git ls-files 'drivers/input/touchscreen/**/Makefile' 2>/dev/null || true); do
-            sed -i 's/\r$//' "$f"
-          done
-          echo "✓ Makefiles/Kconfig saneados."
+          sudo apt-get update -y
+          sudo apt-get install -y dos2unix
+          find device_kernel -type f \( -name "Makefile" -o -name "*.mk" -o -name "Kconfig*" \) -print0 \
+            | xargs -0 dos2unix || true
+          # Corrige tabs/CRLF ocasionais em diretórios críticos
+          sed -i 's/\r$//' device_kernel/drivers/input/touchscreen/focaltech_3680/Makefile || true
 
       - name: Compilar Kernel (defconfig + build)
-        shell: bash
         run: |
           set -euo pipefail
-          cd "${KDIR}"
+          cd device_kernel
+          mkdir -p out
 
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export O="${OUT}"
-          mkdir -p "${OUT}"
+          # Toolchain env do perfil (se existir)
+          # CUSTOM_CMDS/EXTRA_CMDS vêm do .env, então apenas exportamos aqui
+          [ -n "${CUSTOM_CMDS:-}" ] && eval "export ${CUSTOM_CMDS}"
+          [ -n "${EXTRA_CMDS:-}" ] && eval "export ${EXTRA_CMDS}"
 
-          # Se CLANG_TRIPLE foi fornecido no perfil, use como CROSS_COMPILE
-          if [[ -n "${CLANG_TRIPLE:-}" ]]; then
-            export CROSS_COMPILE="${CLANG_TRIPLE}"
-          fi
+          # Se CLANG_PATH foi definido, garante no PATH
+          [ -n "${CLANG_PATH:-}" ] && export PATH="$CLANG_PATH/bin:$PATH"
 
-          echo "-> Preparando O=out"
-          make -j"$(nproc)" O="${OUT}" "${DEFCONFIG_NAME}"
+          echo "Usando defconfig: ${DEFCONFIG_NAME}"
+          make O=out ${DEFCONFIG_NAME}
 
-          echo "-> Compilando"
-          make -j"$(nproc)" \
-            O="${OUT}" \
-            ARCH=arm64 \
-            LLVM="${LLVM:-1}" \
-            LLVM_IAS="${LLVM_IAS:-1}" \
-            CC="${CC:-clang}" \
-            LD="${LD:-ld.lld}"
-
-          # Captura candidatos a imagem
-          IMG=""
-          for c in \
-            "${OUT}/Image.gz-dtb" \
-            "${OUT}/Image.gz" \
-            "${OUT}/Image-dtb" \
-            "${OUT}/Image"; do
-            [[ -f "$c" ]] && IMG="$c" && break || true
-          done
-
-          [[ -n "${IMG}" ]] || { echo "::error::Nenhuma imagem de kernel encontrada em ${OUT}"; ls -lah "${OUT}"; exit 4; }
-
-          echo "KERNEL_IMAGE=${IMG}" >> $GITHUB_ENV
-
-          # opcional dtbo
-          if [[ -f "${OUT}/dtbo.img" ]]; then
-            echo "DTBO_IMAGE=${OUT}/dtbo.img" >> $GITHUB_ENV
-          fi
-
-          echo "✓ Build finalizado."
+          # Alguns trees exigem clean parcial para drivers antes do build
+          make O=out -j"$(nproc --all)"
 
       - name: Empacotar com AnyKernel3
-        shell: bash
         run: |
           set -euo pipefail
-
-          if [[ -z "${KERNEL_IMAGE:-}" ]]; then
-            echo "::error::KERNEL_IMAGE não definido"
-            exit 5
+          git clone --depth=1 -b "${AK3_BRANCH}" "${AK3_SOURCE}" ak3
+          # Copia Image/boot artefatos comuns (ajuste conforme seu tree)
+          if [ -f device_kernel/out/arch/arm64/boot/Image.gz-dtb ]; then
+            cp device_kernel/out/arch/arm64/boot/Image.gz-dtb ak3/
+          elif [ -f device_kernel/out/arch/arm64/boot/Image.gz ]; then
+            cp device_kernel/out/arch/arm64/boot/Image.gz ak3/
+          elif [ -f device_kernel/out/arch/arm64/boot/Image ]; then
+            cp device_kernel/out/arch/arm64/boot/Image ak3/
+          else
+            echo "::error::Image de saída não encontrada"; exit 5
           fi
-
-          rm -rf "${AK3DIR}"
-          git clone --depth=1 -b "${AK3_BRANCH}" "${AK3_SOURCE}" "${AK3DIR}"
-
-          # Copia artefatos
-          cp -f "${KERNEL_IMAGE}" "${AK3DIR}/"
-          if [[ -n "${DTBO_IMAGE:-}" && -f "${DTBO_IMAGE}" ]]; then
-            cp -f "${DTBO_IMAGE}" "${AK3DIR}/"
-          fi
-
-          cd "${AK3DIR}"
-          ZIP="Kernel-${{ inputs.PROFILE_NAME }}-$(date +%Y%m%d-%H%M).zip"
-          zip -r9 "${ZIP}" . -x ".git*" -x "*.zip"
-          echo "AK3_ZIP=${AK3DIR}/${ZIP}" >> $GITHUB_ENV
-          echo "✓ AnyKernel3 pronto: ${ZIP}"
+          (cd ak3 && zip -r9 ../Kernel-star_hyper_a14.zip .)
 
       - name: Publicar artefato
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-${{ inputs.PROFILE_NAME }}
-          path: |
-            ${{ env.AK3_ZIP }}
-            ${{ env.KERNEL_IMAGE }}
-            ${{ env.DTBO_IMAGE }}
-          if-no-files-found: error
-
-      # (Opcional) Release simples se habilitado
-      - name: Criar Release (opcional)
-        if: ${{ inputs.MAKE_RELEASE == true }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "kernel-${{ inputs.PROFILE_NAME }}-${{ github.run_number }}"
-          name: "Kernel ${{ inputs.PROFILE_NAME }} #${{ github.run_number }}"
-          files: |
-            ${{ env.AK3_ZIP }}
-            ${{ env.KERNEL_IMAGE }}
-            ${{ env.DTBO_IMAGE }}
+          name: Kernel-star_hyper_a14
+          path: Kernel-star_hyper_a14.zip
