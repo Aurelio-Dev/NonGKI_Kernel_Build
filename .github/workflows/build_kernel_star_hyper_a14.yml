@@ -4,23 +4,109 @@ on:
   workflow_dispatch:
     inputs:
       PROFILE_NAME:
-        description: "Nome do perfil em Profiles/ (ex.: star_hyper_a14.env)"
-        type: string
+        description: "Nome do perfil em Profiles/ (sem .env)"
         required: true
-        default: star_hyper_a14
+        default: "star_hyper_a14"
       PYTHON_VERSION:
-        description: "Versão do Python usada no build (2 ou 3)"
-        type: choice
-        options:
-          - "2"
-          - "3"
+        description: "Versão do Python para steps auxiliares"
         required: true
         default: "3"
 
 jobs:
   build:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        shell: bash
 
-    uses: ./.github/workflows/build_kernel_template.yml
-    with:
-      PROFILE_NAME: ${{ inputs.PROFILE_NAME }}
-      PYTHON_VERSION: ${{ inputs.PYTHON_VERSION }}
+    steps:
+      # 1) Checkout do repositório (onde estão Profiles/, etc.)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2) (Opcional) Python para scripts auxiliares
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.PYTHON_VERSION }}
+
+      # 3) Instalar pacotes necessários — com sudo + retry (evita dpkg lock)
+      - name: Install required packages (with retry)
+        run: |
+          set -e
+          tries=0
+          until sudo apt-get update; do
+            tries=$((tries+1))
+            if [ $tries -ge 3 ]; then
+              echo "apt-get update failed after $tries tries"
+              exit 1
+            fi
+            echo "apt-get update failed, retrying in 10s..."
+            sleep 10
+          done
+          sudo apt-get install -y --no-install-recommends \
+              git curl ca-certificates \
+              build-essential bc bison flex \
+              libssl-dev libelf-dev ccache \
+              zip unzip lz4 dos2unix
+
+      # 4) Carregar o perfil e exportar variáveis
+      - name: Load profile and export variables
+        id: load_profile
+        run: |
+          set -euo pipefail
+          PROFILE_FILE="Profiles/${{ inputs.PROFILE_NAME }}.env"
+
+          echo "-> Perfil: $PROFILE_FILE"
+          test -f "$PROFILE_FILE" || { echo "ERRO: Perfil não encontrado: $PROFILE_FILE"; exit 1; }
+
+          # Normaliza CRLF -> LF (caso tenha sido salvo no Windows)
+          dos2unix "$PROFILE_FILE" >/dev/null 2>&1 || true
+
+          # Carrega as variáveis do perfil
+          set -a
+          source "$PROFILE_FILE"
+          set +a
+
+          # Valida variáveis essenciais
+          : "${KERNEL_SOURCE:?KERNEL_SOURCE vazio. Verifique o .env}"
+          : "${KERNEL_BRANCH:?KERNEL_BRANCH vazio. Verifique o .env}"
+          : "${DEFCONFIG_NAME:?DEFCONFIG_NAME vazio. Verifique o .env}"
+
+          echo "KERNEL_SOURCE=<$KERNEL_SOURCE>"
+          echo "KERNEL_BRANCH=<$KERNEL_BRANCH>"
+          echo "DEFCONFIG_NAME=<$DEFCONFIG_NAME>"
+          # (Opcional) Exibe outras se quiser:
+          echo "CLANG_SOURCE=<${CLANG_SOURCE:-}>"
+
+          # Exporta para próximos steps via GITHUB_ENV
+          {
+            echo "KERNEL_SOURCE=$KERNEL_SOURCE"
+            echo "KERNEL_BRANCH=$KERNEL_BRANCH"
+            echo "DEFCONFIG_NAME=$DEFCONFIG_NAME"
+            [ -n "${CLANG_SOURCE:-}" ] && echo "CLANG_SOURCE=$CLANG_SOURCE"
+          } >> "$GITHUB_ENV"
+
+      # 5) Clonar o kernel (usa as variáveis exportadas)
+      - name: Get Kernel Source
+        run: |
+          set -euo pipefail
+          echo "Clonando '$KERNEL_SOURCE' (branch '$KERNEL_BRANCH')..."
+          git clone -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
+          echo "Conteúdo de device_kernel/"
+          ls -la device_kernel | head -n 50
+
+      # === A partir daqui você pode seguir com sua pipeline de compilação ===
+      # Ex.: baixar/ajustar toolchain, aplicar patches, compilar, empacotar AnyKernel3, etc.
+      # Os passos abaixo são apenas placeholders para você completar depois.
+
+      - name: (Placeholder) Show DEFCONFIG
+        run: |
+          echo "DEFCONFIG a ser usado: $DEFCONFIG_NAME"
+          # Exemplo de leitura do defconfig dentro do tree (se existir):
+          if [ -f "device_kernel/arch/arm64/configs/${DEFCONFIG_NAME#*/}" ]; then
+            echo "Trecho do defconfig:"
+            sed -n '1,40p' "device_kernel/arch/arm64/configs/${DEFCONFIG_NAME#*/}" || true
+          else
+            echo "Arquivo de defconfig não encontrado neste caminho (isso pode ser normal nesta etapa)."
+          fi
