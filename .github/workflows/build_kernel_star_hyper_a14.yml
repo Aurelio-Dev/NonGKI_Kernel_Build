@@ -97,50 +97,45 @@ jobs:
       #  BLOCO KernelSU — robusto contra diretório existente
       #  (não falha se drivers/kernelsu já existir)
       # ---------------------------------------------------------
+     # ---------------------------------------------------------
+#  BLOCO KernelSU — robusto (idempotente e com validações)
+# ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
-
-          # Onde vamos colocar o KernelSU?
-          KS_DIR=""
-          for d in drivers/kernelsu drivers/ksu drivers/misc/kernelsu; do
-            if [ -d "$d" ]; then KS_DIR="$d"; break; fi
-          done
-          [ -z "$KS_DIR" ] && KS_DIR="drivers/kernelsu"
-
-          mkdir -p "$KS_DIR" || true
-
-          # Clona/atualiza fontes
-          if [ ! -f "$KS_DIR/Kconfig" ] || [ ! -f "$KS_DIR/Makefile" ]; then
-            git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git /tmp/KernelSU
-            cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
-          fi
-
-          # Makefile mínimo (caso não exista)
-          if [ ! -s "$KS_DIR/Makefile" ]; then
-            printf '%s\n' \
-              'obj-$(CONFIG_KSU) += ksu.o' \
-              'ksu-y := main.o' > "$KS_DIR/Makefile"
-          fi
-
-          # Kconfig mínimo (caso não exista)
-          if [ ! -s "$KS_DIR/Kconfig" ]; then
-            printf '%s\n' \
-              'config KSU' \
-              '    bool "KernelSU"' \
-              '    default n' \
-              '    help' \
-              '      Enable KernelSU support.' > "$KS_DIR/Kconfig"
-          fi
-
-          # Garante include no drivers/Kconfig (uma única vez)
+      
+          # Defaults caso não venham do .env
+          : "${KERNELSU_SOURCE:=https://github.com/rsuntk/KernelSU.git}"
+          : "${KERNELSU_BRANCH:=susfs-main}"
+      
+          KS_DIR="drivers/kernelsu"
+      
+          echo "→ Limpando destino para evitar conflito (arquivo/symlink/dir): $KS_DIR"
+          rm -rf "$KS_DIR"
+          mkdir -p "$KS_DIR"
+      
+          echo "→ Clonando KernelSU: ${KERNELSU_SOURCE} (branch: ${KERNELSU_BRANCH})"
+          rm -rf /tmp/KernelSU
+          git clone --depth=1 -b "${KERNELSU_BRANCH}" "${KERNELSU_SOURCE}" /tmp/KernelSU
+      
+          echo "→ Copiando conteúdos relevantes para $KS_DIR"
+          cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
+      
+          # Sanidade: ver se trouxe arquivos-chave
+          test -f "$KS_DIR/Kconfig" || { echo "::error::Kconfig do KernelSU não encontrado em $KS_DIR"; exit 2; }
+          test -f "$KS_DIR/Makefile" || { echo "::error::Makefile do KernelSU não encontrado em $KS_DIR"; exit 2; }
+      
+          echo "→ Garantindo inclusão do Kconfig do KernelSU em drivers/Kconfig"
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
-
-          # Garante entrada no drivers/Makefile
-          grep -q 'obj-$(CONFIG_KSU).*+=.*kernelsu' drivers/Makefile || \
-            echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
+      
+          echo "→ Garantindo entrada no drivers/Makefile para compilar quando CONFIG_KSU=y"
+          # Não duplica se já existir
+          grep -qE 'obj-\$\(\s*CONFIG_KSU\s*\)\s*\+\=\s*kernelsu/?' drivers/Makefile || \
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+      
+          echo "→ KernelSU injetado com sucesso em $KS_DIR"
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
