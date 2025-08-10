@@ -51,7 +51,7 @@ jobs:
               zip unzip lz4 dos2unix
 
       # 4) Carregar o perfil e exportar variáveis
-      - name: Load profile and export variables
+            - name: Load profile and export variables (safe parse)
         id: load_profile
         run: |
           set -euo pipefail
@@ -60,32 +60,51 @@ jobs:
           echo "-> Perfil: $PROFILE_FILE"
           test -f "$PROFILE_FILE" || { echo "ERRO: Perfil não encontrado: $PROFILE_FILE"; exit 1; }
 
-          # Normaliza CRLF -> LF (caso tenha sido salvo no Windows)
+          # Normaliza CRLF -> LF (se veio do Windows)
           dos2unix "$PROFILE_FILE" >/dev/null 2>&1 || true
 
-          # Carrega as variáveis do perfil
+          # Filtra SÓ linhas VAR=valor sem dois-pontos e sem espaços
+          # e pega apenas as variáveis que realmente precisamos.
+          awk -F= '
+            /^[[:space:]]*#/ {next}                           # comentários
+            /^[[:space:]]*$/ {next}                           # vazias
+            /:/            {next}                             # tem dois-pontos -> ignora
+            $1 ~ /^(KERNEL_SOURCE|KERNEL_BRANCH|DEFCONFIG_NAME|CLANG_SOURCE|DEFCONFIG_SOURCE|DEFCONFIG_ORIGIN_DEFCONFIG|GCC_GNU|GCC_64_SOURCE|GCC_32_SOURCE)$/ {
+              print $0
+            }
+          ' "$PROFILE_FILE" > /tmp/profile.clean.env
+
+          echo "---- Variáveis extraídas do perfil ----"
+          cat /tmp/profile.clean.env || true
+          echo "--------------------------------------"
+
+          # Carrega SOMENTE as variáveis filtradas
           set -a
-          source "$PROFILE_FILE"
+          . /tmp/profile.clean.env
           set +a
 
-          # Valida variáveis essenciais
-          : "${KERNEL_SOURCE:?KERNEL_SOURCE vazio. Verifique o .env}"
-          : "${KERNEL_BRANCH:?KERNEL_BRANCH vazio. Verifique o .env}"
-          : "${DEFCONFIG_NAME:?DEFCONFIG_NAME vazio. Verifique o .env}"
+          # Valida as essenciais
+          : "${KERNEL_SOURCE:?KERNEL_SOURCE vazio no perfil}"
+          : "${KERNEL_BRANCH:?KERNEL_BRANCH vazio no perfil}"
+          : "${DEFCONFIG_NAME:?DEFCONFIG_NAME vazio no perfil}"
 
           echo "KERNEL_SOURCE=<$KERNEL_SOURCE>"
           echo "KERNEL_BRANCH=<$KERNEL_BRANCH>"
           echo "DEFCONFIG_NAME=<$DEFCONFIG_NAME>"
-          # (Opcional) Exibe outras se quiser:
-          echo "CLANG_SOURCE=<${CLANG_SOURCE:-}>"
 
-          # Exporta para próximos steps via GITHUB_ENV
+          # Exporta para próximos steps
           {
             echo "KERNEL_SOURCE=$KERNEL_SOURCE"
             echo "KERNEL_BRANCH=$KERNEL_BRANCH"
             echo "DEFCONFIG_NAME=$DEFCONFIG_NAME"
             [ -n "${CLANG_SOURCE:-}" ] && echo "CLANG_SOURCE=$CLANG_SOURCE"
+            [ -n "${DEFCONFIG_SOURCE:-}" ] && echo "DEFCONFIG_SOURCE=$DEFCONFIG_SOURCE"
+            [ -n "${DEFCONFIG_ORIGIN_DEFCONFIG:-}" ] && echo "DEFCONFIG_ORIGIN_DEFCONFIG=$DEFCONFIG_ORIGIN_DEFCONFIG"
+            [ -n "${GCC_GNU:-}" ] && echo "GCC_GNU=$GCC_GNU"
+            [ -n "${GCC_64_SOURCE:-}" ] && echo "GCC_64_SOURCE=$GCC_64_SOURCE"
+            [ -n "${GCC_32_SOURCE:-}" ] && echo "GCC_32_SOURCE=$GCC_32_SOURCE"
           } >> "$GITHUB_ENV"
+
 
       # 5) Clonar o kernel (usa as variáveis exportadas)
       - name: Get Kernel Source
