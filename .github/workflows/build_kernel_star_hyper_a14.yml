@@ -2,157 +2,148 @@ name: Build Kernel • star_hyper_a14
 
 on:
   workflow_dispatch:
-    inputs:
-      PROFILE_NAME:
-        description: "Caminho do perfil em Profiles/ (ex.: Profiles/star_hyper_a14.env)"
-        required: true
-        type: string
-        default: "Profiles/star_hyper_a14.env"
-      PYTHON_VERSION:
-        description: "Versão do Python usada no build (2 ou 3)"
-        required: true
-        type: choice
-        options: ["2", "3"]
-        default: "3"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout deste repositório
+      - name: Checkout (este repo)
         uses: actions/checkout@v4
 
-      # ====== FIX #1: carregar o perfil e persistir variáveis no $GITHUB_ENV ======
-      - name: Carregar perfil e exportar variáveis (persistir no $GITHUB_ENV)
+      # 1) Carregar variáveis do perfil e exportar para o ambiente do job
+      - name: Carregar perfil e exportar variáveis
+        id: load_profile
         shell: bash
         run: |
           set -euo pipefail
-          PERFIL="${{ inputs.PROFILE_NAME }}"
-          echo "→ Perfil: $PERFIL"
+          PERFIL="Profiles/star_hyper_a14.env"
+          echo "-> Perfil: $PERFIL"
+          test -f "$PERFIL"
+          # Exporta tudo do .env para o processo
+          set -a
+          source "$PERFIL"
+          set +a
+          # Grava no ambiente do GITHUB (só as que usamos no workflow)
+          {
+            echo "KERNEL_SOURCE=$KERNEL_SOURCE"
+            echo "KERNEL_BRANCH=${KERNEL_BRANCH:-}"
+            echo "DEFCONFIG_NAME=$DEFCONFIG_NAME"
+            echo "AK3_SOURCE=${AK3_SOURCE:-}"
+            echo "AK3_BRANCH=${AK3_BRANCH:-}"
+            echo "CLANG_SOURCE=${CLANG_SOURCE:-}"
+            echo "CLANG_TRIPLE=${CLANG_TRIPLE:-}"
+            echo "CROSS_COMPILE=${CROSS_COMPILE:-}"
+            echo "CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32:-}"
+          } >> "$GITHUB_ENV"
+          echo "✓ Ambiente pronto e variáveis do perfil carregadas com sucesso."
 
-          if [[ ! -f "$PERFIL" ]]; then
-            echo "::error::Perfil não encontrado: $PERFIL"
-            exit 1
-          fi
-
-          # Exporta pares CHAVE=valor (ignora comentários e linhas vazias)
-          while IFS= read -r line; do
-            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-            if [[ "$line" =~ ^[A-Za-z0-9_]+[[:space:]]*= ]]; then
-              key="$(printf '%s' "$line" | sed -E 's/^([A-Za-z0-9_]+)[[:space:]]*=.*/\1/')"
-              val="$(printf '%s' "$line" | sed -E 's/^[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*//')"
-              # remove aspas ao redor, se houver
-              val="${val%\"}"; val="${val#\"}"
-              echo "$key=$val" >> "$GITHUB_ENV"
-            fi
-          done < "$PERFIL"
-
-          echo "✓ Ambiente pronto e variáveis do perfil persistidas."
-
-      - name: Summary
-        shell: bash
-        run: |
-          echo "✓ Variáveis do perfil carregadas:"
-          env | sort | sed -n '1,150p'
-          echo "— Agora seguimos com os passos do build…"
-
-      # (opcional) pegue AnyKernel3 se seu fluxo usa empacotamento AK3
-      - name: Get AnyKernel3 (opcional)
+      # 2) (Opcional) Clonar AnyKernel3 se AK3_SOURCE estiver no perfil
+      - name: Obter AnyKernel3 (opcional)
         if: ${{ env.AK3_SOURCE != '' }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -d AnyKernel3 ]]; then
-            echo "AnyKernel3 já presente, pulando."
-            exit 0
-          fi
-          if [[ -n "${AK3_SOURCE:-}" ]]; then
-            AK3_BRANCH="${AK3_BRANCH:-master}"
-            git clone --depth=1 --single-branch --branch "$AK3_BRANCH" "$AK3_SOURCE" AnyKernel3
-            echo "✓ AnyKernel3 clonado."
-          else
-            echo "AK3_SOURCE não definido; pulando."
-          fi
+          echo "Clonando AnyKernel3 de: $AK3_SOURCE (branch: ${AK3_BRANCH:-master})"
+          git clone --depth=1 --branch "${AK3_BRANCH:-master}" "$AK3_SOURCE" AnyKernel3
 
-      # ====== FIX #2: clonar a fonte do kernel com fallback de branch ======
+      # 3) Clonar fonte do Kernel
       - name: Clonar fonte do Kernel
         shell: bash
         run: |
           set -euo pipefail
-
-          : "${KERNEL_SOURCE:=}"
-          : "${KERNEL_BRANCH:=}"
-
-          if [[ -z "${KERNEL_SOURCE}" ]]; then
-            echo "::error::KERNEL_SOURCE não definido no perfil"
-            exit 3
+          test -n "${KERNEL_SOURCE:-}" || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
+          BRANCH_ARG=()
+          if [[ -n "${KERNEL_BRANCH:-}" ]]; then
+            BRANCH_ARG=(--branch "$KERNEL_BRANCH")
           fi
-
-          echo "→ Repositório: $KERNEL_SOURCE"
-          if [[ -n "${KERNEL_BRANCH}" ]]; then
-            echo "→ Branch preferido: $KERNEL_BRANCH"
-          else
-            echo "→ Nenhum branch definido; usaremos o branch padrão do repositório."
-          fi
-
-          # Verifica se o branch existe no remoto
-          BRANCH_OK=1
-          if [[ -n "${KERNEL_BRANCH}" ]]; then
-            if git ls-remote --heads "$KERNEL_SOURCE" "$KERNEL_BRANCH" > /dev/null 2>&1; then
-              BRANCH_OK=0
-            fi
-          fi
-
-          if [[ $BRANCH_OK -eq 0 ]]; then
-            echo "→ Clonando com --branch $KERNEL_BRANCH (shallow)…"
-            git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
-          else
-            echo "→ Branch não existe ou não definido. Clonando o branch padrão (shallow)…"
-            git clone --depth=1 "$KERNEL_SOURCE" device_kernel
-          fi
-
+          git clone --depth=1 "${BRANCH_ARG[@]}" "$KERNEL_SOURCE" device_kernel
           echo "✓ Kernel clonado em ./device_kernel"
 
-      # ====== daqui para baixo ficam os seus passos de build/packaging ======
-      # Ex.: preparar toolchain, rodar defconfig, compilar, empacotar com AK3, publicar artefatos etc.
-      # Mantive exemplos comentados; adapte ao seu fluxo.
+      # 4) Instalar dependências (inclui zip/unzip)
+      - name: Instalar dependências de build
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex build-essential libssl-dev libelf-dev \
+            ccache python3 unzip zip curl git rsync
 
-      # - name: Preparar LLVM/Clang (opcional)
-      #   if: ${{ env.CLANG_SOURCE != '' }}
-      #   run: |
-      #     mkdir -p toolchains
-      #     curl -L "$CLANG_SOURCE" -o toolchains/clang.tar.xz
-      #     tar -C toolchains -xf toolchains/clang.tar.xz
-      #     echo "PATH=$PWD/toolchains/LLVM-*/bin:$PATH" >> $GITHUB_ENV
-      #     echo "✓ LLVM/Clang pronto."
+      # 5) (Opcional) Baixar/preparar LLVM/Clang se CLANG_SOURCE estiver no perfil
+      - name: Preparar LLVM/Clang (opcional)
+        if: ${{ env.CLANG_SOURCE != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p toolchains && cd toolchains
+          echo "→ Baixando LLVM/Clang de: $CLANG_SOURCE"
+          curl -L "$CLANG_SOURCE" -o clang.tar.xz
+          tar -xf clang.tar.xz
+          CLANG_DIR="$(ls -1d LLVM-* clang-* 2>/dev/null | head -n1)"
+          if [[ -z "$CLANG_DIR" ]]; then
+            echo "::error::Não foi possível localizar a pasta do LLVM/Clang após extrair."
+            ls -la
+            exit 10
+          fi
+          echo "PATH=$PWD/$CLANG_DIR/bin:$PATH" >> "$GITHUB_ENV"
+          echo "✓ LLVM/Clang em: $PWD/$CLANG_DIR/bin"
 
-      # - name: Compilar Kernel (defconfig + build)
-      #   run: |
-      #     set -euo pipefail
-      #     cd device_kernel
-      #     make O=out $DEFCONFIG_NAME
-      #     make -j"$(nproc)" O=out \
-      #       CC=clang \
-      #       LD=ld.lld \
-      #       LLVM=1 LLVM_IAS=1 \
-      #       ${CLANG_TRIPLE:+CLANG_TRIPLE=$CLANG_TRIPLE} \
-      #       ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
-      #       ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
-      #     echo "✓ Build finalizado."
+      # 6) Compilar (defconfig + build)
+      - name: Compilar Kernel (defconfig + build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd device_kernel
+          export KBUILD_BUILD_USER=gh
+          export KBUILD_BUILD_HOST=actions
 
-      # - name: Empacotar com AnyKernel3
-      #   if: ${{ env.AK3_SOURCE != '' }}
-      #   run: |
-      #     set -euo pipefail
-      #     cp device_kernel/out/arch/arm64/boot/Image* AnyKernel3/
-      #     (cd AnyKernel3 && zip -r ../Kernel-star-hyper-a14-$(date +%Y%m%d-%H%M).zip .)
-      #     echo "✓ Kernel empacotado."
+          if [[ -z "${DEFCONFIG_NAME:-}" ]]; then
+            echo "::error::DEFCONFIG_NAME não definido no perfil"
+            exit 4
+          fi
 
-      # - name: Publicar artefato
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: Kernel-star-hyper-a14
-      #     path: |
-      #       AnyKernel3/*.zip
-      #       device_kernel/out/arch/arm64/boot/Image*
+          echo "→ Usando defconfig: $DEFCONFIG_NAME"
+          make O=out "$DEFCONFIG_NAME"
+
+          echo "→ Compilando…"
+          make -j"$(nproc)" O=out \
+            CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            ${CLANG_TRIPLE:+CLANG_TRIPLE=$CLANG_TRIPLE} \
+            ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
+            ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
+
+          echo "✓ Build concluído."
+
+      # 7) Empacotar com AnyKernel3
+      - name: Empacotar com AnyKernel3
+        if: ${{ env.AK3_SOURCE != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # Detecta a imagem gerada
+          IMG=""
+          for f in device_kernel/out/arch/arm64/boot/Image device_kernel/out/arch/arm64/boot/Image.gz device_kernel/out/arch/arm64/boot/Image.gz-dtb device_kernel/out/arch/arm64/boot/Image.lz4 device_kernel/out/arch/arm64/boot/Image-dtb; do
+            if [[ -f "$f" ]]; then IMG="$f"; break; fi
+          done
+          if [[ -z "$IMG" ]]; then
+            echo "::error::Nenhuma Image* encontrada em out/arch/arm64/boot/"
+            ls -la device_kernel/out/arch/arm64/boot/ || true
+            exit 5
+          fi
+          echo "→ Copiando $IMG para AnyKernel3/"
+          cp "$IMG" AnyKernel3/
+
+          ZIP_NAME="Kernel-star-hyper-a14-$(date +%Y%m%d-%H%M).zip"
+          (cd AnyKernel3 && zip -r "../$ZIP_NAME" .)
+          echo "ZIP_PATH=$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "✓ ZIP gerado: $ZIP_NAME"
+
+      # 8) Publicar artefatos (ZIP e imagens)
+      - name: Publicar artefatos
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-star-hyper-a14
+          path: |
+            *.zip
+            device_kernel/out/arch/arm64/boot/Image*
