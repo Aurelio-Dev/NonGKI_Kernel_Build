@@ -40,8 +40,8 @@ jobs:
           set -euxo pipefail
           test -f "Profiles/${PROFILE_NAME}"
           echo "→ Perfil: Profiles/${PROFILE_NAME}"
-          # Exporta as variáveis do .env para o ambiente do job
-          # (somente linhas do tipo KEY=VALUE sem espaços ao redor do '=')
+
+          # Exporta as variáveis do .env
           while IFS='=' read -r k v; do
             case "$k" in ''|\#*) continue;; esac
             v="${v%\"}"; v="${v#\"}"
@@ -85,18 +85,17 @@ jobs:
           echo "KERNEL_TREE=$(pwd)" >> $GITHUB_ENV
 
       # ---------------------------------------------------------
-      #  BLOCO KernelSU — robusto com fallback de caminho
+      #  KernelSU com fallback de diretório + geração via printf
       # ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
 
-          # Escolhe um caminho seguro: se drivers/kernelsu for um ARQUIVO, usa fallback
+          # Escolhe caminho seguro (evita 'File exists' se houver arquivo)
           KS_DIR=""
           for cand in drivers/kernelsu drivers/ksu drivers/misc/kernelsu; do
             if [ -e "$cand" ] && [ ! -d "$cand" ]; then
-              # Existe mas é arquivo -> não usamos este
               continue
             fi
             KS_DIR="$cand"
@@ -106,40 +105,36 @@ jobs:
 
           mkdir -p "$KS_DIR"
 
-          # Clona KernelSU apenas se ainda não estiver em /tmp
+          # Clona uma vez
           if [ ! -d /tmp/KernelSU ]; then
             git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git /tmp/KernelSU
           fi
-
-          # Copia o conteúdo do kernel do KernelSU (ignora se já existir)
           rsync -a --ignore-existing /tmp/KernelSU/kernel/ "$KS_DIR/"
 
-          # Makefile mínimo (se ausente/vazio)
+          # Makefile mínimo (via printf — evita YAML quebrar por causa de ':')
           if [ ! -s "$KS_DIR/Makefile" ]; then
-            cat > "$KS_DIR/Makefile" <<'EOF'
-obj-$(CONFIG_KSU) += ksu.o
-ksu-y := main.o
-EOF
+            printf '%s\n' \
+              'obj-$(CONFIG_KSU) += ksu.o' \
+              'ksu-y := main.o' \
+              > "$KS_DIR/Makefile"
           fi
 
-          # Kconfig mínimo (se ausente/vazio)
+          # Kconfig mínimo (via printf)
           if [ ! -s "$KS_DIR/Kconfig" ]; then
-            cat > "$KS_DIR/Kconfig" <<'EOF'
-config KSU
-    bool "KernelSU"
-    default n
-    help
-      Enable KernelSU support.
-EOF
+            printf '%s\n' \
+              'config KSU' \
+              '    bool "KernelSU"' \
+              '    default n' \
+              '    help' \
+              '      Enable KernelSU support.' \
+              > "$KS_DIR/Kconfig"
           fi
 
-          # Se está em drivers/, garante include e objeto
+          # Entradas nos arquivos de drivers (idempotente)
           if [[ "$KS_DIR" == drivers/* ]]; then
-            # drivers/Kconfig
             if ! grep -q "source \"$KS_DIR/Kconfig\"" drivers/Kconfig; then
               echo "source \"$KS_DIR/Kconfig\"" >> drivers/Kconfig
             fi
-            # drivers/Makefile
             modname="$(basename "$KS_DIR")"
             if ! grep -q "obj-\\$(CONFIG_KSU).*+=.*${modname}/" drivers/Makefile; then
               echo "obj-\$(CONFIG_KSU) += ${modname}/" >> drivers/Makefile
@@ -163,11 +158,9 @@ EOF
           export ARCH=arm64
           export SUBARCH=arm64
 
-          # defconfig
-          make -j$(nproc) "${DEFCONFIG_NAME}"
+          make -j"$(nproc)" "${DEFCONFIG_NAME}"
 
-          # build
-          make -j$(nproc) \
+          make -j"$(nproc)" \
             ${LLVM:+LLVM=1} \
             ${LLVM_IAS:+LLVM_IAS=1} \
             ${LD:+LD=$LD} \
