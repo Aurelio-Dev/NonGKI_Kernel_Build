@@ -157,6 +157,41 @@ jobs:
             git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" "$KERNEL_DIR"
           fi
 
+      - name: Sanear Makefiles/Kconfig (CRLF/BOM/TAB)
+        shell: bash
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          echo "→ Removendo CRLF e BOM de Makefiles/Kconfig/*.mk…"
+          sudo apt-get update
+          sudo apt-get install -y dos2unix
+
+          # 1) Remover CRLF em alvos de build
+          find . -type f \( -name "Makefile" -o -name "Makefile.*" -o -name "*.mk" -o -name "Kconfig*" \) -print0 \
+            | xargs -0 -I{} bash -c 'dos2unix -q "{}" || true'
+
+          # 2) Remover BOM (UTF-8) se existir
+          find . -type f \( -name "Makefile" -o -name "Makefile.*" -o -name "*.mk" -o -name "Kconfig*" \) -print0 \
+            | xargs -0 -I{} bash -c 'sed -i "1s/^\xEF\xBB\xBF//" "{}"'
+
+          # 3) Caso específico: drivers/input/touchscreen/focaltech_3680/Makefile
+          FT="drivers/input/touchscreen/focaltech_3680/Makefile"
+          if [[ -f "$FT" ]]; then
+            echo "→ Normalizando $FT"
+            sed -i 's/\r$//' "$FT"            # garantir LF
+            sed -i '1s/^\xEF\xBB\xBF//' "$FT" # remover BOM
+
+            # Converter linhas com muitos espaços à esquerda (receitas) para TAB
+            # (apenas em linhas que começam com espaços e não são comentário)
+            awk '{
+              if ($0 ~ /^[ ]{4,}[^#[:space:]]/) {
+                sub(/^[ ]+/, "\t"); print
+              } else { print }
+            }' "$FT" > "$FT.tmp" && mv "$FT.tmp" "$FT"
+          fi
+
+          echo "✓ Makefiles/Kconfig saneados."
+
       - name: Compilar Kernel (defconfig + build)
         shell: bash
         working-directory: ${{ env.KERNEL_DIR }}
