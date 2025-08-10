@@ -101,18 +101,34 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
+
           KS_DIR="drivers/kernelsu"
-          mkdir -p "$KS_DIR"
-          if [ ! -f "$KS_DIR/Kconfig" ] || [ ! -f "$KS_DIR/Makefile" ]; then
-            git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git /tmp/KernelSU
-            cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
+
+          # Se existir como ARQUIVO, removemos para poder criar a pasta
+          if [ -e "$KS_DIR" ] && [ ! -d "$KS_DIR" ]; then
+            rm -f "$KS_DIR"
           fi
+
+          # Cria diretório (ok se já existir)
+          mkdir -p "$KS_DIR"
+
+          # Se não há Kconfig/Makefile do KernelSU, povoar a pasta
+          if [ ! -f "$KS_DIR/Kconfig" ] || [ ! -f "$KS_DIR/Makefile" ]; then
+            # Clona KernelSU (branch susfs-main)
+            TMP_KSU="$(mktemp -d)"
+            git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git "$TMP_KSU"
+            cp -av "$TMP_KSU/kernel/"* "$KS_DIR"/
+          fi
+
+          # Makefile mínimo apenas se não existir ou estiver vazio
           if [ ! -s "$KS_DIR/Makefile" ]; then
             printf '%s\n' \
               'obj-$(CONFIG_KSU) += ksu.o' \
               'ksu-y := main.o' \
               > "$KS_DIR/Makefile"
           fi
+
+          # Kconfig mínimo apenas se não existir ou estiver vazio
           if [ ! -s "$KS_DIR/Kconfig" ]; then
             printf '%s\n' \
               'config KSU' \
@@ -122,13 +138,17 @@ jobs:
               '      Enable KernelSU support.' \
               > "$KS_DIR/Kconfig"
           fi
+
+          # Garante inclusão no drivers/Kconfig (uma única vez)
           if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
           fi
-          if ! grep -q 'obj-$(CONFIG_KSU).*+=.*kernelsu' drivers/Makefile; then
+
+          # Garante entrada no drivers/Makefile (para compilar quando CONFIG_KSU=y)
+          if ! grep -q 'obj-$(CONFIG_KSU).*+=.*kernelsu/?$' drivers/Makefile; then
             echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
           fi
-
+  
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
           set -euxo pipefail
