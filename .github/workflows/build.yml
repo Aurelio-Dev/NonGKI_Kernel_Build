@@ -84,6 +84,7 @@ jobs:
       - build_kernel_redmi8_4_19_aosp_a15
       - build_kernel_k40gaming_hyper_a13
       - build_kernel_note10pro_miui_a13
+      - build_kernel_star_hyper_a14
     if: ${{ inputs.make_release }}
     env:
       REPO_OWNER: JackA1ltman
