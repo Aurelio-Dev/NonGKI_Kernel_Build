@@ -1,0 +1,27 @@
+name: Build Kernel • star_hyper_a14
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+  
+    uses: ./.github/workflows/build_kernel_template.yml
+    secrets: inherit
+    with:
+     
+      PROFILE_NAME: star_hyper_a14
+
+      
+      PYTHON_VERSION: "3"
+      PACK_METHOD: AnyKernel3
+      KERNELSU_METHOD: shell
+
+      
+      FREE_MORE_SPACE: true
+      BUILD_DEBUGGER: false
+      SKIP_PATCH: false
+
+      # normalmente qcom pro Star (SM8350)
+      GENERATE_DTB: false
+      GENERATE_CHIP: qcom
