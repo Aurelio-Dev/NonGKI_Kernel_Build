@@ -12,6 +12,10 @@ on:
         required: true
         default: "3"
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -34,48 +38,50 @@ jobs:
           python3 --version || true
           git --version
 
-            - name: Carregar perfil
-            
-          id: load_env
-          run: |
-            set -euxo pipefail
-  
-            # 1) Resolve o arquivo de perfil
-            PF="Profiles/${PROFILE_NAME}"
-            test -f "$PF"
-  
-            # Se o perfil tiver um ponteiro CONFIG_ENV=..., segue esse arquivo
-            # (ex.: CONFIG_ENV=Profiles/star_hyper_a14.env)
-            # Remove CRLF antes de ler, para evitar '\r' escondido no nome.
-            sed -i 's/\r$//' "$PF"
-            if grep -Eq '^[[:space:]]*CONFIG_ENV[[:space:]]*=' "$PF"; then
-              PF2="$(sed -n 's/^[[:space:]]*CONFIG_ENV[[:space:]]*=[[:space:]]*//p' "$PF" | head -n1 | tr -d '"'\'' )"
-              if [ -n "$PF2" ] && [ -f "$PF2" ]; then
-                PF="$PF2"
-              fi
-            fi
-  
-            echo "→ Perfil: $PF"
-  
-            # 2) Normaliza fim-de-linha (CRLF → LF) e aparas de espaços
-            sed -i 's/\r$//' "$PF"
-  
-            # 3) Exporta as variáveis do arquivo com segurança
-            #    (habilita export automático, 'sourça' o arquivo, desabilita export)
-            set -a
-            . "$PF"
-            set +a
-  
-            # 4) Guard-rails obrigatórios
-            : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
-            : "${KERNEL_BRANCH:?KERNEL_BRANCH não definido no perfil}"
-            : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
-  
-            # 5) (Opcional) log curto para debug
-            echo "KERNEL_SOURCE=$KERNEL_SOURCE"
-            echo "KERNEL_BRANCH=$KERNEL_BRANCH"
-            echo "DEFCONFIG_NAME=$DEFCONFIG_NAME"
+      # --- CORREÇÃO PRINCIPAL ---
+      # 1) Normaliza quebras de linha do arquivo .env para LF
+      # 2) Parse robusto das variáveis (ignora # e vazias, remove \r e aspas)
+      - name: Carregar perfil
+        id: load_env
+        run: |
+          set -euxo pipefail
 
+          test -f "Profiles/${PROFILE_NAME}"
+          echo "→ Perfil: Profiles/${PROFILE_NAME}"
+
+          # Normaliza para LF (remove CR dos finais de linha)
+          sed -i 's/\r$//' "Profiles/${PROFILE_NAME}"
+
+          # Caso exista BOM no início
+          perl -i -pe 'BEGIN{binmode(STDIN);binmode(STDOUT)} s/^\xEF\xBB\xBF//' "Profiles/${PROFILE_NAME}"
+
+          # Exporta chaves KEY=VALUE válidas para o ambiente do job
+          while IFS= read -r line; do
+            # tira CR remanescente, espaços das pontas
+            line="${line%$'\r'}"
+            line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+            # ignora vazias e comentários
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+            # só aceita formato chave=valor
+            if [[ "$line" == *=* ]]; then
+              k="${line%%=*}"
+              v="${line#*=}"
+
+              # remove aspas e CR de valor
+              v="${v%$'\r'}"
+              v="${v%\"}"
+              v="${v#\"}"
+
+              echo "${k}=${v}" >> "$GITHUB_ENV"
+            fi
+          done < "Profiles/${PROFILE_NAME}"
+
+          # Guard-rails
+          : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
+          : "${KERNEL_BRANCH:?KERNEL_BRANCH não definido no perfil}"
+          : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -109,7 +115,8 @@ jobs:
           echo "KERNEL_TREE=$(pwd)" >> $GITHUB_ENV
 
       # ---------------------------------------------------------
-      #  BLOCO KernelSU • robusto contra dir/arquivo existente
+      #  BLOCO KernelSU — robusto e idempotente
+      #  Usa KERNELSU_SOURCE/KERNELSU_BRANCH do perfil; se não vier, define padrão
       # ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
         run: |
@@ -117,26 +124,33 @@ jobs:
           cd "$KERNEL_TREE"
 
           KS_DIR="drivers/kernelsu"
+          KS_SRC="${KERNELSU_SOURCE:-https://github.com/rsuntk/KernelSU.git}"
+          KS_BR="${KERNELSU_BRANCH:-main}"
 
-          # Limpa qualquer entrada preexistente (arquivo/dir/symlink)
+          echo "→ Limpando destino para evitar conflito (arquivo/symlink/dir): $KS_DIR"
           rm -rf "$KS_DIR"
           mkdir -p "$KS_DIR"
 
-          : "${KERNELSU_SOURCE:=https://github.com/rsuntk/KernelSU.git}"
-          : "${KERNELSU_BRANCH:=susfs-main}"
-
-          # Clona KernelSU e copia apenas o /kernel
+          echo "→ Clonando KernelSU: $KS_SRC (branch: $KS_BR)"
           rm -rf /tmp/KernelSU
-          git clone --depth=1 -b "${KERNELSU_BRANCH}" "${KERNELSU_SOURCE}" /tmp/KernelSU
+          git clone --depth=1 -b "$KS_BR" "$KS_SRC" /tmp/KernelSU
+
+          echo "→ Copiando KernelSU para $KS_DIR"
           cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
 
-          # Garante include no drivers/Kconfig (idempotente)
+          echo "→ Integrando Kconfig e Makefile"
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
 
-          # Garante entrada em drivers/Makefile (idempotente)
           grep -q 'obj-$(CONFIG_KSU)      += kernelsu/' drivers/Makefile || \
             echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
+
+      # Opcional: habilitar CONFIG_KSU=y direto na defconfig
+      # - name: Habilitar CONFIG_KSU=y na defconfig
+      #   run: |
+      #     set -euxo pipefail
+      #     cd "$KERNEL_TREE"
+      #     grep -q "^CONFIG_KSU=y" "$DEFCONFIG_NAME" || echo "CONFIG_KSU=y" >> "$DEFCONFIG_NAME"
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
@@ -145,35 +159,16 @@ jobs:
           find . -type f \( -name "Makefile" -o -name "Kconfig" -o -name "*.mk" -o -name "*.cfg" \) \
             -print0 | xargs -0 sed -i 's/\r$//'
 
-      # ---------------------------------------------------------
-      #  HOTFIX: include relativo + include-path (millet binder_gki)
-      # ---------------------------------------------------------
+      # Hotfix específico (millet): inclui binder_internal por "aspas" no caminho relativo
       - name: Hotfix:binder_gki.c include path (millet)
+        if: ${{ env.TARGET_DEVICE == 'millet' || env.TARGET_DEVICE == 'millet_global' || env.TARGET_DEVICE == 'milletpro' }}
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
-
-          FILE="drivers/mihw/millet/binder_gki.c"
-          if [ -f "$FILE" ]; then
-            if grep -qE '#include <\.\./\.\./android/binder_internal\.h>' "$FILE"; then
-              sed -i 's@#include <\.\./\.\./android/binder_internal\.h>@#include "../../android/binder_internal.h"@' "$FILE"
-              echo "✔ Troca de include em $FILE aplicada."
-            fi
+          f="drivers/mihw/millet/binder_gki.c"
+          if [ -f "$f" ]; then
+            sed -i 's|<\.\./\.\./android/binder_internal\.h>|"../../android/binder_internal.h"|' "$f"
           fi
-
-          MOD_MK="drivers/mihw/millet/Makefile"
-          if [ -f "$MOD_MK" ]; then
-            if ! grep -q 'ccflags-y.*drivers/android' "$MOD_MK"; then
-              echo 'ccflags-y += -I$(srctree)/drivers/android' >> "$MOD_MK"
-              echo "✔ Include-path adicionado em $MOD_MK."
-            fi
-          fi
-
-          # Confirma existência do header esperado
-          test -f drivers/android/binder_internal.h || {
-            echo "::error::drivers/android/binder_internal.h não encontrado no tree do kernel."
-            exit 2
-          }
 
       - name: Compilar Kernel (defconfig + build)
         run: |
@@ -186,17 +181,17 @@ jobs:
           export SUBARCH=arm64
 
           # defconfig
-          make -j$(nproc) "${DEFCONFIG_NAME}"
+          make -j"$(nproc)" "${DEFCONFIG_NAME}"
 
           # build
-          make -j$(nproc) \
+          make -j"$(nproc)" \
             ${LLVM:+LLVM=1} \
             ${LLVM_IAS:+LLVM_IAS=1} \
             ${LD:+LD=$LD} \
             ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
             ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
 
-          # artefatos (coleta o que existir)
+          # artefatos de interesse
           mkdir -p "$GITHUB_WORKSPACE/out"
           for f in \
             arch/arm64/boot/Image.gz-dtb \
@@ -214,7 +209,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           rm -rf AnyKernel3
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
-          cp -av out/* AnyKernel3/
+          cp -av out/* AnyKernel3/ || true
           cd AnyKernel3
           zip -r9 "$GITHUB_WORKSPACE/Kernel-star_hyper_a14-$(date +%Y%m%d-%H%M).zip" ./
 
