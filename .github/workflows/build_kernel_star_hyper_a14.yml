@@ -36,22 +36,35 @@ jobs:
 
       - name: Carregar perfil
         id: load_env
+        shell: bash
         run: |
-          set -euxo pipefail
-          test -f "Profiles/${PROFILE_NAME}"
-          echo "→ Perfil: Profiles/${PROFILE_NAME}"
-          # Exporta as variáveis do .env para o ambiente do job
-          # (somente linhas do tipo KEY=VALUE sem espaços ao redor do '=')
-          while IFS='=' read -r k v; do
-            case "$k" in ''|\#*) continue;; esac
-            v="${v%\"}"; v="${v#\"}"
-            echo "$k=$v" >> "$GITHUB_ENV"
-          done < "Profiles/${PROFILE_NAME}"
+          set -euox pipefail
+          PROFILE="Profiles/${PROFILE_NAME}"
+          test -f "$PROFILE"
+          echo "→ Perfil: $PROFILE"
 
-          # Guard-rails
-          test -n "${KERNEL_SOURCE:-}"   || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
-          test -n "${KERNEL_BRANCH:-}"   || { echo "::error::KERNEL_BRANCH não definido no perfil"; exit 3; }
-          test -n "${DEFCONFIG_NAME:-}"  || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 3; }
+          ALLOWED_KEYS='^(DEVICE_NAME|DEVICE_CODENAME|KERNEL_SOURCE|KERNEL_BRANCH|DEFCONFIG_NAME|DEFCONFIG_SOURCE|DEFCONFIG_ORIGIN_DEFCONFIG|CLANG_SOURCE|AK3_SOURCE|AK3_BRANCH|CUSTOM_CMDS|EXTRA_CMDS|KERNELSU_SOURCE|KERNELSU_BRANCH|KERNELSU_NAME|SUSFS_ENABLE|SUSFS_FIXED|SUSFS_UPDATE|BOOT_SOURCE|LXC_ENABLE|HAVE_NO_DTBO|HAVE_NO_DTBO_TOOL|ROM_TEXT|GCC_GNU|GCC_64_SOURCE|GCC_64_BRANCH|GCC_32_SOURCE|GCC_32_BRANCH|CLANG_TRIPLE)$'
+
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            if [[ "$line" =~ ^([A-Za-z0-9_]+)=(.*)$ ]]; then
+              key="${BASH_REMATCH[1]}"
+              val="${BASH_REMATCH[2]}"
+              if [[ "$key" =~ $ALLOWED_KEYS ]]; then
+                val="${val%\"}"; val="${val#\"}"
+                val="${val%\'}"; val="${val#\'}"
+                printf -v "$key" '%s' "$val"
+                export "$key"
+                echo "$key=$val" >> "$GITHUB_ENV"
+              fi
+            fi
+          done < "$PROFILE"
+
+          [[ -n "${KERNEL_SOURCE:-}" ]] || { echo "::error::KERNEL_SOURCE ausente"; exit 3; }
+          [[ -n "${KERNEL_BRANCH:-}" ]] || { echo "::error::KERNEL_BRANCH ausente"; exit 3; }
+          [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME ausente"; exit 3; }
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -84,34 +97,22 @@ jobs:
           cd device_kernel
           echo "KERNEL_TREE=$(pwd)" >> $GITHUB_ENV
 
-      # ---------------------------------------------------------
-      #  BLOCO KernelSU — embutido logo após clonar o kernel
-      #  Cria drivers/kernelsu, adiciona Makefile/Kconfig e inclui
-      #  no tree drivers/ (evita o erro: 'drivers/kernelsu/Kconfig: can't open file')
-      # ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
-
           KS_DIR="drivers/kernelsu"
           mkdir -p "$KS_DIR"
-
-          # Se já existir algo, não faz nada (idempotente)
           if [ ! -f "$KS_DIR/Kconfig" ] || [ ! -f "$KS_DIR/Makefile" ]; then
             git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git /tmp/KernelSU
             cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
           fi
-
-          # Makefile mínimo (somente se não existir ou estiver vazio)
           if [ ! -s "$KS_DIR/Makefile" ]; then
             printf '%s\n' \
               'obj-$(CONFIG_KSU) += ksu.o' \
               'ksu-y := main.o' \
               > "$KS_DIR/Makefile"
           fi
-
-          # Kconfig mínimo (somente se não existir ou estiver vazio)
           if [ ! -s "$KS_DIR/Kconfig" ]; then
             printf '%s\n' \
               'config KSU' \
@@ -121,24 +122,12 @@ jobs:
               '      Enable KernelSU support.' \
               > "$KS_DIR/Kconfig"
           fi
-
-          # Garante include no drivers/Kconfig (uma única vez)
           if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
           fi
-
-          # Garante entrada no drivers/Makefile (para compilar quando CONFIG_KSU=y)
           if ! grep -q 'obj-$(CONFIG_KSU).*+=.*kernelsu' drivers/Makefile; then
             echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
           fi
-
-
-      # (Opcional) se quiser forçar CONFIG_KSU=y direto na defconfig:
-      # - name: Habilitar CONFIG_KSU=y na defconfig
-      #   run: |
-      #     set -euxo pipefail
-      #     cd "$KERNEL_TREE"
-      #     grep -q "^CONFIG_KSU=y" "$DEFCONFIG_NAME" || echo "CONFIG_KSU=y" >> "$DEFCONFIG_NAME"
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
@@ -151,29 +140,17 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
-
-          # Exibe defconfig que veio do perfil (.env)
           echo "Usando defconfig: ${DEFCONFIG_NAME}"
-
-          # Exporta variáveis de compilação conforme ambiente
-          # (se baixou clang via CLANG_SOURCE, já temos LLVM=1/LD=ld.lld etc.)
           export ARCH=arm64
           export SUBARCH=arm64
-
-          # defconfig
           make -j$(nproc) "${DEFCONFIG_NAME}"
-
-          # build
           make -j$(nproc) \
             ${LLVM:+LLVM=1} \
             ${LLVM_IAS:+LLVM_IAS=1} \
             ${LD:+LD=$LD} \
             ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
             ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
-
-          # artefatos de interesse
           mkdir -p "$GITHUB_WORKSPACE/out"
-          # Image.gz / Image / Image.gz-dtb variam por tree — coletar o que existir
           for f in \
             arch/arm64/boot/Image.gz-dtb \
             arch/arm64/boot/Image.gz \
