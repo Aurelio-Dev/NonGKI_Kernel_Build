@@ -61,6 +61,10 @@ jobs:
           test -n "${KERNEL_SOURCE:-}"   || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 3; }
           test -n "${KERNEL_BRANCH:-}"   || { echo "::error::KERNEL_BRANCH não definido no perfil"; exit 3; }
           test -n "${DEFCONFIG_NAME:-}"  || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 3; }
+          
+          # Defaults seguros para o KernelSU (se o .env não trouxer)
+          echo "KERNELSU_SOURCE=${KERNELSU_SOURCE:-https://github.com/rsuntk/KernelSU.git}" >> "$GITHUB_ENV"
+          echo "KERNELSU_BRANCH=${KERNELSU_BRANCH:-susfs-main}" >> "$GITHUB_ENV"
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -104,38 +108,39 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
-      
-          # Defaults caso não venham do .env
-          : "${KERNELSU_SOURCE:=https://github.com/rsuntk/KernelSU.git}"
-          : "${KERNELSU_BRANCH:=susfs-main}"
-      
+
           KS_DIR="drivers/kernelsu"
-      
-          echo "→ Limpando destino para evitar conflito (arquivo/symlink/dir): $KS_DIR"
+          BR="${KERNELSU_BRANCH:-susfs-main}"
+          REPO="${KERNELSU_SOURCE:-https://github.com/rsuntk/KernelSU.git}"
+
+          echo "→ Origem do KernelSU: $REPO"
+          echo "→ Branch solicitada:  $BR"
+
+          # 🔎 Verifica se a branch existe no remoto; se não, cai para 'susfs-main'
+          if git ls-remote --heads "$REPO" "$BR" | grep -q .; then
+            echo "✓ Branch '$BR' existe no remoto."
+          else
+            echo "⚠️  Branch '$BR' não existe em $REPO — usando 'susfs-main'."
+            BR="susfs-main"
+          fi
+
+          # Limpa qualquer coisa existente e recria diretório de destino
           rm -rf "$KS_DIR"
           mkdir -p "$KS_DIR"
-      
-          echo "→ Clonando KernelSU: ${KERNELSU_SOURCE} (branch: ${KERNELSU_BRANCH})"
+
+          # Clona os fontes e copia pro destino
           rm -rf /tmp/KernelSU
-          git clone --depth=1 -b "${KERNELSU_BRANCH}" "${KERNELSU_SOURCE}" /tmp/KernelSU
-      
-          echo "→ Copiando conteúdos relevantes para $KS_DIR"
+          git clone --depth=1 -b "$BR" "$REPO" /tmp/KernelSU
           cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
-      
-          # Sanidade: ver se trouxe arquivos-chave
-          test -f "$KS_DIR/Kconfig" || { echo "::error::Kconfig do KernelSU não encontrado em $KS_DIR"; exit 2; }
-          test -f "$KS_DIR/Makefile" || { echo "::error::Makefile do KernelSU não encontrado em $KS_DIR"; exit 2; }
-      
-          echo "→ Garantindo inclusão do Kconfig do KernelSU em drivers/Kconfig"
+
+          # Garante include no Kconfig/Makefile do kernel (sem duplicar)
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
-      
-          echo "→ Garantindo entrada no drivers/Makefile para compilar quando CONFIG_KSU=y"
-          # Não duplica se já existir
-          grep -qE 'obj-\$\(\s*CONFIG_KSU\s*\)\s*\+\=\s*kernelsu/?' drivers/Makefile || \
-            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-      
-          echo "→ KernelSU injetado com sucesso em $KS_DIR"
+
+          grep -q 'obj-$(CONFIG_KSU)      += kernelsu/' drivers/Makefile || \
+            echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
+
+          echo "→ KernelSU injetado com sucesso."
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
