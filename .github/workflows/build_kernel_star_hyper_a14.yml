@@ -1,260 +1,70 @@
-name: Build Kernel • star_hyper_a14
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-
-    env:
-      PROFILE_FILE: Profiles/star_hyper_a14.env
-      KERNEL_DIR: device_kernel
-      AK3_DIR: AnyKernel3
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Obter AnyKernel3 (se não houver)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! -d "$AK3_DIR" ]]; then
-            echo "→ Clonando AnyKernel3 (opcional)…"
-            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3_DIR"
-          else
-            echo "✓ AnyKernel3 já presente."
-          fi
-
-      - name: (Opcional) Baixar e preparar LLVM/Clang do perfil
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Exporta variáveis úteis do perfil para o ambiente
-          if [[ -f "$PROFILE_FILE" ]]; then
-            TMP_EXPORT="$(mktemp)"
-            sed -E 's/^\s*#.*$//g; s/\r$//g' "$PROFILE_FILE" \
-            | sed -E 's/^(CUSTOM_CMDS:|EXTRA_CMDS:)\s*//g' \
-            | grep -E '^[A-Za-z0-9_]+=' > "$TMP_EXPORT" || true
-            export $(sed -n 's/^\([A-Za-z0-9_]\+\)=.*/\1/p' "$TMP_EXPORT")
-            cat "$TMP_EXPORT" >> "$GITHUB_ENV"
-            rm -f "$TMP_EXPORT"
-            echo "✓ Variáveis do perfil carregadas."
-          fi
-
-          # Se o perfil não definir CLANG_SOURCE, pulamos (o build pode usar clang do sistema)
-          if [[ -z "${CLANG_SOURCE:-}" ]]; then
-            echo "→ CLANG_SOURCE não definido; passo LLVM será pulado."
-            exit 0
-          fi
-
-      # ====== BLOCO ROBUSTO DO LLVM (com fallback para apt.llvm.org) ======
-      - name: Preparar LLVM/Clang (opcional)
-        if: ${{ env.CLANG_SOURCE != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y curl xz-utils tar ca-certificates gnupg lsb-release
-
-          mkdir -p toolchains && cd toolchains
-
-          echo "→ Baixando LLVM/Clang de: $CLANG_SOURCE"
-          # Tentativa com reintentos e retomada
-          curl -L --retry 5 --retry-delay 10 -C - -A "GitHubActions/1.0" \
-            "$CLANG_SOURCE" -o clang.tar.xz
-
-          # (Opcional) validação por SHA256, se o perfil fornecer CLANG_SHA256
-          if [[ -n "${CLANG_SHA256:-}" ]]; then
-            echo "${CLANG_SHA256}  clang.tar.xz" | sha256sum -c - || {
-              echo "::warning::SHA256 não confere; tentando baixar novamente…"
-              rm -f clang.tar.xz
-              curl -L --retry 5 --retry-delay 10 -C - -A "GitHubActions/1.0" \
-                "$CLANG_SOURCE" -o clang.tar.xz
-              echo "${CLANG_SHA256}  clang.tar.xz" | sha256sum -c - || {
-                echo "::error::Tarball do LLVM corrompido após nova tentativa."
-                exit 2
-              }
-            }
-          fi
-
-          echo "→ Validando xz…"
-          if ! xz -t clang.tar.xz 2>/dev/null; then
-            echo "::warning::xz -t falhou; dump de arquivo:"
-            file clang.tar.xz || true
-            head -c 512 clang.tar.xz | od -An -tx1 || true
-            echo "→ Fallback direto para apt.llvm.org (clang-19)"
-            cd ..
-            sudo apt-get install -y wget
-            wget https://apt.llvm.org/llvm.sh
-            chmod +x llvm.sh
-            sudo ./llvm.sh 19 all
-            echo "CLANG_BIN=clang-19" >> "$GITHUB_ENV"
-            echo "LLD_BIN=ld.lld-19"  >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          echo "→ Extraindo (tar xJf)…"
-          if ! tar -xJf clang.tar.xz; then
-            echo "::warning::tar -xJf falhou; tentando via pipe (xz -d -c | tar x)"
-            if ! xz -d -c clang.tar.xz | tar x; then
-              echo "::warning::Extração via pipe falhou também."
-              echo "Espaço/Memory debug:"
-              df -h || true
-              free -h || true
-              echo "→ Fallback para apt.llvm.org (clang-19)"
-              cd ..
-              sudo apt-get install -y wget
-              wget https://apt.llvm.org/llvm.sh
-              chmod +x llvm.sh
-              sudo ./llvm.sh 19 all
-              echo "CLANG_BIN=clang-19" >> "$GITHUB_ENV"
-              echo "LLD_BIN=ld.lld-19"  >> "$GITHUB_ENV"
-              exit 0
-            fi
-          fi
-
-          CLANG_DIR="$(ls -1d LLVM-* clang-* 2>/dev/null | head -n1 || true)"
-          if [[ -z "$CLANG_DIR" ]]; then
-            echo "::warning::Não achei pasta do LLVM após extrair; listando…"
-            ls -la
-            echo "→ Fallback para apt.llvm.org (clang-19)"
-            cd ..
-            sudo apt-get install -y wget
-            wget https://apt.llvm.org/llvm.sh
-            chmod +x llvm.sh
-            sudo ./llvm.sh 19 all
-            echo "CLANG_BIN=clang-19" >> "$GITHUB_ENV"
-            echo "LLD_BIN=ld.lld-19"  >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          echo "PATH=$PWD/$CLANG_DIR/bin:$PATH" >> "$GITHUB_ENV"
-          echo "CLANG_BIN=clang"  >> "$GITHUB_ENV"
-          echo "LLD_BIN=ld.lld"   >> "$GITHUB_ENV"
-          echo "✓ LLVM/Clang pronto em: $PWD/$CLANG_DIR/bin"
-      # ====== FIM DO BLOCO ROBUSTO DO LLVM ======
-
-      - name: Clonar fonte do Kernel
-        shell: bash
-        run: |
-          set -euo pipefail
-          : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
-          if [[ -z "${KERNEL_BRANCH:-}" ]]; then
-            echo "::error::KERNEL_BRANCH não definido no perfil."
-            exit 3
-          fi
-
-          if [[ -d "$KERNEL_DIR/.git" ]]; then
-            echo "✓ Kernel já clonado em $KERNEL_DIR"
-          else
-            echo "→ Clonando kernel: $KERNEL_SOURCE (branch: $KERNEL_BRANCH)"
-            git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" "$KERNEL_DIR"
-          fi
-
-      - name: Sanear Makefiles/Kconfig (CRLF/BOM/TAB)
+      - name: Integrar KernelSU (se ausente)
         shell: bash
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euo pipefail
-          echo "→ Removendo CRLF e BOM de Makefiles/Kconfig/*.mk…"
-          sudo apt-get update
-          sudo apt-get install -y dos2unix
 
-          # 1) Remover CRLF em alvos de build
-          find . -type f \( -name "Makefile" -o -name "Makefile.*" -o -name "*.mk" -o -name "Kconfig*" \) -print0 \
-            | xargs -0 -I{} bash -c 'dos2unix -q "{}" || true'
-
-          # 2) Remover BOM (UTF-8) se existir
-          find . -type f \( -name "Makefile" -o -name "Makefile.*" -o -name "*.mk" -o -name "Kconfig*" \) -print0 \
-            | xargs -0 -I{} bash -c 'sed -i "1s/^\xEF\xBB\xBF//" "{}"'
-
-          # 3) Caso específico: drivers/input/touchscreen/focaltech_3680/Makefile
-          FT="drivers/input/touchscreen/focaltech_3680/Makefile"
-          if [[ -f "$FT" ]]; then
-            echo "→ Normalizando $FT"
-            sed -i 's/\r$//' "$FT"            # garantir LF
-            sed -i '1s/^\xEF\xBB\xBF//' "$FT" # remover BOM
-
-            # Converter linhas com muitos espaços à esquerda (receitas) para TAB
-            # (apenas em linhas que começam com espaços e não são comentário)
-            awk '{
-              if ($0 ~ /^[ ]{4,}[^#[:space:]]/) {
-                sub(/^[ ]+/, "\t"); print
-              } else { print }
-            }' "$FT" > "$FT.tmp" && mv "$FT.tmp" "$FT"
+          # 1) Se drivers/kernelsu não existir, clona e injeta o código do KernelSU
+          if [[ ! -f drivers/kernelsu/Makefile ]]; then
+            echo "→ Injetando KernelSU em drivers/kernelsu/"
+            rm -rf /tmp/ksu
+            git clone --depth=1 -b susfs-main https://github.com/rsuntk/KernelSU.git /tmp/ksu
+            mkdir -p drivers/kernelsu
+            rsync -a --delete /tmp/ksu/kernel/ drivers/kernelsu/
+          else
+            echo "✓ drivers/kernelsu já presente"
           fi
 
-          echo "✓ Makefiles/Kconfig saneados."
+          # 2) Garantir referências em drivers/Kconfig
+          if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
+            echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
+            echo "→ Adicionado include do Kconfig do KernelSU em drivers/Kconfig"
+          else
+            echo "✓ drivers/Kconfig já referencia drivers/kernelsu/Kconfig"
+          fi
+
+          # 3) Garantir referências em drivers/Makefile
+          if ! grep -q 'obj-\$(CONFIG_KSU) \+= kernelsu/' drivers/Makefile; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+            echo "→ Adicionado obj-$(CONFIG_KSU) += kernelsu/ em drivers/Makefile"
+          else
+            echo "✓ drivers/Makefile já referencia kernelsu/"
+          fi
+
+      # (opcional mas recomendado) saneamento de finais de linha/BOM que você já tem
+      # - name: Sanear Makefiles/Kconfig (CRLF/BOM/TAB)
+      #   ...
 
       - name: Compilar Kernel (defconfig + build)
         shell: bash
         working-directory: ${{ env.KERNEL_DIR }}
+        env:
+          DEFCONFIG_NAME: ${{ env.DEFCONFIG_NAME }}  # já deve estar vindo do seu env
+          TOOLCHAIN: ${{ env.TOOLCHAIN }}
         run: |
           set -euo pipefail
 
-          : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
-
-          CC_BIN="${CLANG_BIN:-clang}"
-          LD_BIN="${LLD_BIN:-ld.lld}"
-
-          echo "→ Preparando O=out"
+          echo "→ Limpando out e preparando build"
           mkdir -p out
-          make -j"$(nproc)" O=out mrproper
-          make -j"$(nproc)" O=out "$DEFCONFIG_NAME"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER=runner
+          export KBUILD_BUILD_HOST=github
+          export PATH="${TOOLCHAIN}:${PATH}"
 
-          echo "→ Build com CC=$CC_BIN / LD=$LD_BIN"
-          make -j"$(nproc)" O=out \
-            CC="$CC_BIN" LD="$LD_BIN" LLVM=1 LLVM_IAS=1 \
-            ${CLANG_TRIPLE:+CLANG_TRIPLE=$CLANG_TRIPLE} \
-            ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
-            ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
+          # Defconfig
+          make O=out ${DEFCONFIG_NAME}
 
-          echo "→ Artefatos:"
-          ls -lh out/arch/arm64/boot || true
-
-      - name: Empacotar com AnyKernel3
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! -d "$AK3_DIR" ]]; then
-            echo "AnyKernel3 não presente; pulando."
-            exit 0
+          # Ativar CONFIG_KSU=y na configuração final
+          echo 'CONFIG_KSU=y' > /tmp/ksu.config
+          if [[ -x scripts/kconfig/merge_config.sh ]]; then
+            scripts/kconfig/merge_config.sh -O out out/.config /tmp/ksu.config
+            make O=out olddefconfig
+          else
+            cat /tmp/ksu.config >> out/.config
+            yes "" | make O=out olddefconfig
           fi
 
-          BOOT_DIR="$KERNEL_DIR/out/arch/arm64/boot"
-          IMG=""
-          for f in Image.gz-dtb Image.gz Image; do
-            if [[ -f "$BOOT_DIR/$f" ]]; then
-              IMG="$BOOT_DIR/$f"
-              break
-            fi
-          done
+          # Compilar (ajuste -j conforme necessário)
+          make -j"$(nproc)" O=out
 
-          if [[ -z "$IMG" ]]; then
-            echo "::warning::Nenhum Image*/Image.gz-dtb para empacotar."
-            ls -lah "$BOOT_DIR" || true
-            exit 0
-          fi
-
-          echo "→ Copiando $IMG para AnyKernel3"
-          cp -f "$IMG" "$AK3_DIR"/Image.gz-dtb 2>/dev/null || cp -f "$IMG" "$AK3_DIR"/Image
-
-          ZIP_NAME="Kernel-star_hyper_a14-$(date +%F-%H%M).zip"
-          echo "→ Gerando $ZIP_NAME"
-          ( cd "$AK3_DIR" && zip -r9 "../$ZIP_NAME" * >/dev/null )
-          echo "PACKAGE_ZIP=$ZIP_NAME" >> "$GITHUB_ENV"
-
-      - name: Publicar artefato
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-star_hyper_a14
-          path: |
-            ${{ env.PACKAGE_ZIP }}
-            ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/*
-          if-no-files-found: warn
