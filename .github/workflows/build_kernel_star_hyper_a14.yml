@@ -2,26 +2,25 @@ name: Build Kernel • star_hyper_a14
 
 on:
   workflow_dispatch:
+    inputs:
+      PROFILE_NAME:
+        description: "Nome do perfil em Profiles/ (ex.: star_hyper_a14.env)"
+        type: string
+        required: true
+        default: star_hyper_a14
+      PYTHON_VERSION:
+        description: "Versão do Python usada no build (2 ou 3)"
+        type: choice
+        options:
+          - "2"
+          - "3"
+        required: true
+        default: "3"
 
 jobs:
   build:
-  
+
     uses: ./.github/workflows/build_kernel_template.yml
-    secrets: inherit
     with:
-     
-      PROFILE_NAME: star_hyper_a14
-
-      
-      PYTHON_VERSION: "3"
-      PACK_METHOD: AnyKernel3
-      KERNELSU_METHOD: shell
-
-      
-      FREE_MORE_SPACE: true
-      BUILD_DEBUGGER: false
-      SKIP_PATCH: false
-
-      # normalmente qcom pro Star (SM8350)
-      GENERATE_DTB: false
-      GENERATE_CHIP: qcom
+      PROFILE_NAME: ${{ inputs.PROFILE_NAME }}
+      PYTHON_VERSION: ${{ inputs.PYTHON_VERSION }}
