@@ -163,23 +163,18 @@ jobs:
             sed -i 's/\bloff_t[[:space:]]\+off;/__maybe_unused loff_t off;/' "$f"
             echo "→ Hotfix aplicado em $f"
           fi
-
       - name: Compilar Kernel (defconfig + build, com log)
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          export ARCH=arm64 SUBARCH=arm64 LC_ALL=C
-          if [[ -n "${CLANG_DIR:-}" && -d "${CLANG_DIR}" ]]; then
-            export PATH="${CLANG_DIR}/bin:${PATH}"
-          fi
 
-          # === Detecta defconfig automaticamente ===
           want="${DEFCONFIG_NAME}"
           base="${want##*/}"
           path1="arch/arm64/configs/${want}"
           found=""
 
+          # 1) Resolver o defconfig solicitado, com fallbacks
           if [[ -f "$path1" ]]; then
             found="$want"
           else
@@ -197,7 +192,7 @@ jobs:
           fi
 
           if [[ -z "$found" ]]; then
-            echo "::warning::Defconfig '${want}' não encontrado. Listando alguns candidatos:"
+            echo "::warning::Defconfig '${want}' não encontrado. Alguns candidatos:"
             find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -n 200 || true
             for fb in vendor/gki_defconfig gki_defconfig; do
               if [[ -f "arch/arm64/configs/$fb" ]]; then found="$fb"; echo "→ Usando fallback: $fb"; break; fi
@@ -210,14 +205,26 @@ jobs:
           fi
 
           echo "→ Defconfig selecionado: $found"
-          make O=out "$found" V=1 2>&1 | tee build.log
-          # evita prompts do kconfig
-          make O=out olddefconfig 2>&1 | tee -a build.log
 
-          # Build principal com log completo
+          # 2) Gera defconfig
+          make O=out "$found" V=1 2>&1 | tee build.log
+
+          # 3) FORÇAR modo não-interativo para novas opções (aceitar defaults)
+          yes "" | make O=out olddefconfig    2>&1 | tee -a build.log
+          yes "" | make O=out syncconfig      2>&1 | tee -a build.log
+
+          # (opcional) pequenos ajustes conhecidos que geram -Werror
+          chmod +x ./scripts/config
+          ./scripts/config --file out/.config -d CONFIG_ZRAM      || true
+          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC  || true
+          yes "" | make O=out olddefconfig    2>&1 | tee -a build.log
+
+          # 4) Build principal — fixar host em Clang e deixar tudo LLVM
           set +e
-          make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 V=1 \
+          make -j"$(nproc)" \
+               O=out LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               HOSTCC=clang HOSTCXX=clang++ V=1 \
                2>&1 | tee -a build.log
           MAKE_RC=${PIPESTATUS[0]}
           set -e
