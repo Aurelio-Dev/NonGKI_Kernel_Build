@@ -12,10 +12,6 @@ jobs:
   build:
     runs-on: ubuntu-22.04
 
-    env:
-      # deixa explícito que o alvo é arm64 em todas as chamadas de make
-      ARCH: arm64
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,23 +25,25 @@ jobs:
           set -euo pipefail
           mkdir -p Profiles
           PROFILE_PATH="Profiles/${{ github.event.inputs.PROFILE_NAME }}"
-          if [[ ! -f "$PROFILE_PATH" ]]; then
-            echo "::error::Arquivo de perfil não encontrado: $PROFILE_PATH"
+          if [[ ! -f "${PROFILE_PATH}" ]]; then
+            echo "::error::Arquivo de perfil não encontrado: ${PROFILE_PATH}"
             ls -la Profiles || true
             exit 2
           fi
-          echo "→ Usando perfil: $PROFILE_PATH"
-          sed -i 's/\r$//' "$PROFILE_PATH"
+          echo "→ Usando perfil: ${PROFILE_PATH}"
+          sed -i 's/\r$//' "${PROFILE_PATH}"
           while IFS= read -r raw || [[ -n "$raw" ]]; do
-            [[ -z "$raw" || "$raw" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$raw" ]] && continue
+            [[ "$raw" =~ ^[[:space:]]*# ]] && continue
             if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
               k="${raw%%=*}"; v="${raw#*=}"
               v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+              k="${k%$'\r'}"; v="${v%$'\r'}"
               export "$k=$v"
               echo "$k=$v" >> "$GITHUB_ENV"
               printf '  %s=%s\n' "$k" "$v"
             fi
-          done < "$PROFILE_PATH"
+          done < "${PROFILE_PATH}"
           [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
           [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
 
@@ -97,31 +95,29 @@ jobs:
           cd "$KERNEL_DIR"
           rm -rf KernelSU drivers/kernelsu drivers/KernelSU ksu_tmp || true
           mkdir -p drivers
+          [[ -n "${KERNELSU_SOURCE:-}" ]] || exit 0
           git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" ksu_tmp
           CAND_DIR=""
           for d in "ksu_tmp/KernelSU" "ksu_tmp/kernel" "ksu_tmp"; do
-            if [[ -f "$d/Makefile" ]]; then CAND_DIR="$d"; break; fi
+            [[ -f "$d/Makefile" || -f "$d/Kbuild" ]] && { CAND_DIR="$d"; break; }
           done
-          [[ -n "$CAND_DIR" ]] || { echo "::error::Não achei Makefile do KernelSU no repositório"; exit 2; }
+          [[ -n "$CAND_DIR" ]] || { echo "::error::Não achei Makefile/Kbuild do KernelSU"; exit 2; }
           mkdir -p drivers/kernelsu
           cp -a "${CAND_DIR}/." drivers/kernelsu/
-          if [[ ! -f drivers/kernelsu/Kconfig && -f drivers/kernelsu/kernel/Kconfig ]]; then
-            cp -f drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
-          fi
+          # se só houver Kbuild, crie um Makefile compatível
+          [[ -f drivers/kernelsu/Makefile ]] || [[ ! -f drivers/kernelsu/Kbuild ]] || \
+            echo 'include $(src)/Kbuild' > drivers/kernelsu/Makefile
           ln -sfn kernelsu drivers/KernelSU
-          sed -i '/obj-y[[:space:]]\+\+=\s*KernelSU\//d' drivers/Makefile || true
-          sed -i '/source\s*"drivers\/KernelSU\/Kconfig"/d' drivers/Kconfig || true
-          grep -q 'KernelSU/include' drivers/Makefile 2>/dev/null || \
-            echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
-          grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile 2>/dev/null || \
-            echo 'obj-y += kernelsu/' >> drivers/Makefile
-          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null; then
-            printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
-          fi
-          awk '!x[$0]++' drivers/Makefile > .mk && mv .mk drivers/Makefile
-          awk '!x[$0]++' drivers/Kconfig  > .kc && mv .kc drivers/Kconfig
+          # Não deixa entradas duplicadas
+          sed -i '/obj-.*KernelSU\//d' drivers/Makefile || true
+          sed -i '/obj-.*kernelsu\//d' drivers/Makefile || true
+          sed -i '/source "drivers\/KernelSU\/Kconfig"/d' drivers/Kconfig || true
+          sed -i '/source "drivers\/kernelsu\/Kconfig"/d' drivers/Kconfig || true
+          # e adiciona a nova referência
+          grep -q 'obj-y\s\+\+=\s*kernelsu/' drivers/Makefile 2>/dev/null || echo 'obj-y += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null || echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
 
-      - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
+      - name: Sanear textos (CRLF/BOM)
         shell: bash
         run: |
           set -euxo pipefail
@@ -132,129 +128,70 @@ jobs:
             | cut -d: -f1 \
             | xargs -r sed -i 's/\r$//'
 
-      - name: Hotfix EROFS (unused variable com -Werror)
+      - name: Hotfix EROFS (warning → não-erro)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
           f="fs/erofs/inode.c"
-          if [[ -f "$f" ]] && grep -qE '\bloff_t[[:space:]]+off;' "$f"; then
-            sed -i 's/\bloff_t[[:space:]]\+off;/__maybe_unused loff_t off;/' "$f"
+          if [[ -f "$f" ]] && grep -qE '^[[:space:]]*loff_t[[:space:]]+off;' "$f"; then
+            sed -i 's/^\([[:space:]]*\)loff_t[[:space:]]\+off;/\1__maybe_unused loff_t off;/' "$f"
             echo "→ Hotfix aplicado em $f"
           fi
 
       - name: Limpeza de vestígios de build no source
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           cd "$KERNEL_DIR"
-          rm -rf include/config include/generated arch/arm64/include/generated .config .config.old 2>/dev/null || true
+          # limpa restos de build dentro do source (o nosso build usa O=out)
+          rm -rf include/config include/generated arch/arm64/include/generated .config .config.old || true
           mkdir -p out
 
       - name: Configurar e compilar (robusto)
         shell: bash
-        env:
-          LLVM: 1
-          CC: clang
-          LD: ld.lld
-          HOSTCC: clang
-          HOSTCXX: clang++
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # =========================
-          # Resolver DEFCONFIG (robusto)
-          # =========================
-          want="${DEFCONFIG_NAME#./}"          # remove ./ se vier
-          want="${want#arch/arm64/configs/}"   # normaliza se vier com prefixo
+          # Resolver defconfig
+          want="${DEFCONFIG_NAME}"
           base="${want##*/}"
-          base_no_vendor="${base#vendor/}"     # ex.: vendor/foo_defconfig -> foo_defconfig
-
+          path1="arch/arm64/configs/${want}"
           found=""
-
-          # 1) Caminho exato informado
-          if [[ -f "arch/arm64/configs/$want" ]]; then
+          if [[ -f "$path1" ]]; then
             found="$want"
+          else
+            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
           fi
+          [[ -z "$found" ]] && found="gki_defconfig"
+          echo "→ Usando defconfig: $found"
 
-          # 2) Se não achou, tente variações do mesmo nome
-          if [[ -z "$found" ]]; then
-            for try in \
-              "$base" \
-              "vendor/$base" \
-              "$base_no_vendor" \
-              "vendor/$base_no_vendor"
-            do
-              if [[ -f "arch/arm64/configs/$try" ]]; then
-                found="$try"
-                break
-              fi
-            done
-          fi
+          # Defconfig + olddefconfig não interativo
+          make O=out ARCH=arm64 "$found" V=1 2>&1 | tee build.log
+          yes "" | make O=out ARCH=arm64 olddefconfig 2>&1 | tee -a build.log
 
-          # 3) Se ainda não achou, procure por arquivo com o mesmo *basename* no repositório
-          if [[ -z "$found" ]]; then
-            cand="$(git ls-files arch/arm64/configs | grep -E "/(${base}|${base_no_vendor})$" | head -n1 || true)"
-            if [[ -n "$cand" ]]; then
-              found="${cand#arch/arm64/configs/}"
-            fi
-          fi
-
-          # 4) Último recurso: fallbacks comuns de GKI
-          if [[ -z "$found" ]]; then
-            for fb in "vendor/gki_defconfig" "gki_defconfig"; do
-              if [[ -f "arch/arm64/configs/$fb" ]]; then
-                echo "::warning::Defconfig '${want}' não encontrado. Usando fallback: $fb"
-                found="$fb"
-                break
-              fi
-            done
-          fi
-
-          # 5) Se mesmo assim não achou, loga candidatos e falha explicitamente
-          if [[ -z "$found" ]]; then
-            echo "::error::Nenhum defconfig compatível encontrado para '${want}'."
-            echo "Alguns defconfigs disponíveis:"
-            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -n 200 || true
-            exit 2
-          fi
-
-          echo "→ Defconfig selecionado: $found"
-
-          # =========================
-          # Geração de .config (não-interativa)
-          # =========================
-          # Limpeza esquemática já foi feita antes; garantimos OUT
-          mkdir -p out
-
-          # 1) defconfig base
-          make O=out ARCH=arm64 "$found" V=1      2>&1 | tee build.log
-
-          # 2) sincroniza sem interação
-          make O=out ARCH=arm64 olddefconfig      2>&1 | tee -a build.log
-
-          # 3) Desliga Werror e zram/zsmalloc para evitar abortos por warnings
+          # Força: ZRAM off, ZSMALLOC on (evita NR_ZSPAGES em taskstats)
           chmod +x ./scripts/config
-          ./scripts/config --file out/.config -d CONFIG_ZRAM        || true
-          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC    || true
-          ./scripts/config --file out/.config -d CONFIG_WERROR      || true
-          ./scripts/config --file out/.config -d CONFIG_CC_WERROR   || true
-          make O=out ARCH=arm64 olddefconfig      2>&1 | tee -a build.log
+          ./scripts/config --file out/.config -d CONFIG_ZRAM || true
+          ./scripts/config --file out/.config -e CONFIG_ZSMALLOC || true
+          yes "" | make O=out ARCH=arm64 olddefconfig 2>&1 | tee -a build.log
 
-          # (opcional) mostra estados
-          grep -E 'CONFIG_(ZRAM|ZSMALLOC|WERROR|CC_WERROR)=' out/.config || true
+          echo "→ Checando .config:"
+          egrep -n 'CONFIG_(ZRAM|ZSMALLOC)=' out/.config || true
 
-          # =========================
-          # Build
-          # =========================
-          # Warnings não viram erro; força LLVM/Clang; host em clang também
-          KBUILD_CFLAGS="-Wno-error" KCFLAGS="-Wno-error" WERROR=0 \
+          # Build (desativa Werror globalmente)
+          set +e
           make -j"$(nproc)" \
                O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
-               HOSTCC=clang HOSTCXX=clang++ V=1 \
-               2>&1 | tee -a build.log
-
+               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               HOSTCC=clang HOSTCXX=clang++ \
+               KCFLAGS="-Wno-error" KCPPFLAGS="-Wno-error" WERROR=0 \
+               V=1 2>&1 | tee -a build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          exit $rc
 
       - name: Diagnóstico de falha (se houver)
         if: failure()
@@ -264,10 +201,10 @@ jobs:
           cd "$KERNEL_DIR"
           echo "=== HEAD do log (200 linhas) ==="; head -n 200 build.log || true
           echo "=== TAIL do log (200 linhas) ==="; tail -n 200 build.log || true
-          echo "=== Erros encontrados (±3) ==="
-          grep -nEi -C3 '(^|\s)(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
+          echo "=== Erros encontrados (contexto ±3) ==="
+          grep -nEi -C3 '(^|[[:space:]])(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
           echo "=== .config (parcial) ==="
-          test -f out/.config && sed -n '1,140p' out/.config || true
+          test -f out/.config && sed -n '1,200p' out/.config || true
 
       - name: Upload de logs e .config
         if: always()
