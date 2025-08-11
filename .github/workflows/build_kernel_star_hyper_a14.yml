@@ -153,6 +153,38 @@ jobs:
           test -f drivers/KernelSU/Kconfig  || { echo "::error::Faltando drivers/KernelSU/Kconfig";  exit 2; }
 
 
+      - name: "Ajustar layout do KernelSU (links em drivers/* + includes)"
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+
+          # Garante que o repo KernelSU exista na raiz e tenha o Kconfig interno
+          if [[ ! -d KernelSU || ! -f KernelSU/kernel/Kconfig ]]; then
+            rm -rf KernelSU
+            git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
+          fi
+
+          # links que o kbuild espera (ambos por segurança: CamelCase e minúsculo)
+          rm -rf drivers/KernelSU drivers/kernelsu
+          mkdir -p drivers
+          ln -s ../KernelSU/kernel drivers/KernelSU
+          ln -s ../KernelSU/kernel drivers/kernelsu
+
+          # drivers/Kconfig → inclui o Kconfig do KernelSU
+          if ! grep -q 'drivers/KernelSU/Kconfig' drivers/Kconfig 2>/dev/null; then
+            printf '\nsource "drivers/KernelSU/Kconfig"\n' >> drivers/Kconfig
+          fi
+
+          # drivers/Makefile → inclui headers e diretório do KernelSU
+          grep -q 'KernelSU/include' drivers/Makefile 2>/dev/null || \
+            echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
+
+          grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile 2>/dev/null || \
+            echo 'obj-y += KernelSU/' >> drivers/Makefile
+
+          echo "→ Verificando:"
+          ls -la drivers/KernelSU | sed -n '1,80p'
 
       - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
         shell: bash
@@ -211,6 +243,7 @@ jobs:
 
           echo "→ Defconfig selecionado: $found"
           make O=out "$found" V=1 2>&1 | tee build.log
+          make O=out olddefconfig 2>&1 | tee -a build.log
 
           # Build principal com log completo
           set +e
