@@ -44,8 +44,9 @@ jobs:
               printf '  %s=%s\n' "$k" "$v"
             fi
           done < "${PROFILE_PATH}"
-          [[ -n "${KERNEL_SOURCE:-}"   ]] || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
-          [[ -n "${DEFCONFIG_NAME:-}"  ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
+
+          [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
+          [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -89,7 +90,6 @@ jobs:
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
       - name: Injetar KernelSU (normaliza layout em drivers/kernelsu + symlink CamelCase)
-        if: ${{ env.KERNELSU_SOURCE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -178,34 +178,62 @@ jobs:
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # 1) Resolver defconfig
+          echo "DEFCONFIG_NAME=${DEFCONFIG_NAME}"
+
           want="${DEFCONFIG_NAME}"
           base="${want##*/}"
-          path1="arch/arm64/configs/${want}"
+          dir="arch/arm64/configs"
           found=""
-          if [[ -f "$path1" ]]; then
+
+          # 1) Caminho exato
+          if [[ -f "$dir/$want" ]]; then
             found="$want"
-          else
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
           fi
-          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
-          echo "→ Usando defconfig: $found"
 
-          # 2) Gera defconfig e sincroniza sem interação (SEM 'yes')
-          make O=out "$found" V=1 2>&1 | tee build.log
-          make O=out olddefconfig  2>&1 | tee -a build.log
-          make O=out syncconfig    2>&1 | tee -a build.log
+          # 2) Procura exata em qualquer subpasta
+          if [[ -z "$found" ]]; then
+            cand="$(git -C . ls-files "$dir/**/$base" | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#${dir}/}"
+          fi
 
-          # 3) Overrides anti-ZRAM (se quiser evitar -Werror nesse driver)
+          # 3) Se terminar com _defconfig, tenta padrão por prefixo
+          if [[ -z "$found" && "$base" == *_defconfig ]]; then
+            prefix="${base%_defconfig}"
+            cand="$(git -C . ls-files "$dir/**/${prefix}*_defconfig" | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#${dir}/}"
+          fi
+
+          # 4) Se não encontrou, avisa e tenta fallbacks
+          if [[ -z "$found" ]]; then
+            echo "::warning::Defconfig '${want}' não encontrado. Candidatos:"
+            git -C . ls-files "$dir/**/*defconfig" | sed "s#^$dir/##" | sort | head -n 200 || true
+            for fb in vendor/gki_defconfig gki_defconfig defconfig; do
+              if [[ -f "$dir/$fb" ]]; then
+                found="$fb"
+                echo "→ Usando fallback: $fb"
+                break
+              fi
+            done
+          fi
+
+          [[ -n "$found" ]] || { echo "::error::Não foi possível resolver um defconfig válido"; exit 2; }
+          echo "→ Defconfig final: $found"
+
+          # 5) Gera e sincroniza .config (sem 'yes')
+          make O=out ARCH=arm64 "$found"        2>&1 | tee build.log
+          make O=out ARCH=arm64 olddefconfig    2>&1 | tee -a build.log
+          make O=out ARCH=arm64 syncconfig      2>&1 | tee -a build.log
+
+          # 6) Overrides (opcional) e reconsolida
           chmod +x ./scripts/config
           ./scripts/config --file out/.config -d CONFIG_ZRAM     || true
           ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
-          make O=out olddefconfig  2>&1 | tee -a build.log
+          make O=out ARCH=arm64 olddefconfig    2>&1 | tee -a build.log
 
-          # 4) Build principal com LLVM/Clang
+          # 7) Build
           set +e
-          make -j"$(nproc)" O=out LLVM=1 CC=clang LD=ld.lld \
+          make -j"$(nproc)" \
+               O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ V=1 \
                2>&1 | tee -a build.log
@@ -226,7 +254,7 @@ jobs:
           echo "=== Erros encontrados (contexto ±3) ==="
           grep -nEi -C3 '(^|\s)(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
           echo "=== .config (parcial) ==="
-          test -f out/.config && sed -n '1,120p' out/.config || true
+          test -f out/.config && sed -n '1,160p' out/.config || true
 
       - name: Upload de logs e .config
         if: always()
@@ -238,7 +266,7 @@ jobs:
             ${{ env.KERNEL_DIR }}/out/.config
 
       - name: Empacotar com AnyKernel3
-        if: ${{ success() && env.AK3_SOURCE != '' }}
+        if: success()
         shell: bash
         run: |
           set -euxo pipefail
