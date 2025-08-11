@@ -44,8 +44,8 @@ jobs:
               printf '  %s=%s\n' "$k" "$v"
             fi
           done < "${PROFILE_PATH}"
-          [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
-          [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
+          [[ -n "${KERNEL_SOURCE:-}"   ]] || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
+          [[ -n "${DEFCONFIG_NAME:-}"  ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -89,38 +89,32 @@ jobs:
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
       - name: Injetar KernelSU (normaliza layout em drivers/kernelsu + symlink CamelCase)
+        if: ${{ env.KERNELSU_SOURCE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          # Limpa tentativas anteriores
           rm -rf KernelSU drivers/kernelsu drivers/KernelSU ksu_tmp || true
           mkdir -p drivers
 
-          # Clona em tmp
           git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" ksu_tmp
 
-          # Descobre onde estão Makefile/Kconfig "reais"
           CAND_DIR=""
           for d in "ksu_tmp/KernelSU" "ksu_tmp/kernel" "ksu_tmp"; do
             if [[ -f "$d/Makefile" ]]; then CAND_DIR="$d"; break; fi
           done
           [[ -n "$CAND_DIR" ]] || { echo "::error::Não achei Makefile do KernelSU no repositório"; exit 2; }
 
-          # Copia nivelado para drivers/kernelsu
           mkdir -p drivers/kernelsu
           cp -a "${CAND_DIR}/." drivers/kernelsu/
 
-          # Se Kconfig estiver em kernel/Kconfig, crie alias no topo
           if [[ ! -f drivers/kernelsu/Kconfig && -f drivers/kernelsu/kernel/Kconfig ]]; then
             cp -f drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
           fi
 
-          # Symlink com maiúscula para satisfazer referências antigas
           ln -sfn kernelsu drivers/KernelSU
 
-          # Ajusta Makefile e Kconfig (remove velhos, adiciona novos e deduplica)
           sed -i '/obj-y[[:space:]]\+\+=\s*KernelSU\//d' drivers/Makefile || true
           sed -i '/source\s*"drivers\/KernelSU\/Kconfig"/d' drivers/Kconfig || true
 
@@ -165,11 +159,10 @@ jobs:
           fi
 
       - name: Ajustes de árvore (KernelSU/kernelsu + higiene)
+        shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-
-          # Se houver referências incondicionais a KernelSU/kernelsu, comenta-as
           for f in drivers/Makefile drivers/Kconfig; do
             if [[ -f "$f" ]]; then
               sed -i 's/^\(obj-[^=]*[[:space:]]\+KernelSU\/\)/# \1/' "$f" || true
@@ -179,63 +172,38 @@ jobs:
             fi
           done
 
-      # ========= BLOCO NOVO: resolver defconfig com fallbacks e compilar =========
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # ========= Resolver DEFCONFIG com fallbacks =========
-          want="${DEFCONFIG_NAME:-vendor/gki_defconfig}"
+          # 1) Localiza defconfig desejado
+          want="${DEFCONFIG_NAME}"
           base="${want##*/}"
+          path1="arch/arm64/configs/${want}"
           found=""
-
-          try_list=(
-            "$want"
-            "vendor/${base}"
-            "${base}"
-            "vendor/gki_defconfig"
-            "gki_defconfig"
-          )
-
-          for cand in "${try_list[@]}"; do
-            if [[ -f "arch/arm64/configs/$cand" ]]; then
-              found="$cand"; break
-            fi
-          done
-
-          # Fuzzy search final
-          if [[ -z "$found" ]]; then
-            cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
-            if [[ -z "$cand" ]]; then
-              prefix="${base%_defconfig}"
-              cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
-            fi
+          if [[ -f "$path1" ]]; then
+            found="$want"
+          else
+            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
             [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
           fi
-
-          if [[ -z "$found" ]]; then
-            echo "::warning::Defconfig '${want}' não encontrado. Alguns candidatos:"
-            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | sort | head -n 200 || true
-            echo "::error::Sem defconfig válido; ajuste o input ou adicione o arquivo."
-            exit 2
-          fi
-
+          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
 
-          # ========= Gera defconfig + sincroniza =========
+          # 2) Gera defconfig (ARM64) e abre log
           make O=out ARCH=arm64 "$found" V=1 2>&1 | tee build.log
-          make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
-          make O=out ARCH=arm64 syncconfig    2>&1 | tee -a build.log
 
-          # ========= Overrides anti-ZRAM (opcional) =========
-          chmod +x ./scripts/config
-          ./scripts/config --file out/.config -d CONFIG_ZRAM     || true
-          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
-          make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
+          # 3) Overrides **forçados** via KCONFIG_ALLCONFIG (ZRAM/ZSMALLOC desligados)
+          cat > local.overrides <<'EOF'
+          CONFIG_ZRAM=n
+          CONFIG_ZSMALLOC=n
+          EOF
+          KCONFIG_ALLCONFIG=local.overrides yes "" | make O=out ARCH=arm64 olddefconfig 2>&1 | tee -a build.log
+          grep -E '^(CONFIG_ZRAM|CONFIG_ZSMALLOC)=' out/.config || true
 
-          # ========= Build =========
+          # 4) Build principal com LLVM/Clang
           set +e
           make -j"$(nproc)" \
                O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
@@ -271,7 +239,7 @@ jobs:
             ${{ env.KERNEL_DIR }}/out/.config
 
       - name: Empacotar com AnyKernel3
-        if: success()
+        if: ${{ success() && env.AK3_SOURCE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
