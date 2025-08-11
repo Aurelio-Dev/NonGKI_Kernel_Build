@@ -29,19 +29,67 @@ jobs:
             git gperf libncurses-dev libssl-dev python3 unzip xz-utils \
             clang lld llvm
 
-      - name: Clonar fonte do Kernel (robusto a branch ausente)
+      # === NOVO: carrega variáveis do perfil (URLs/branch/defconfig etc.) ===
+      - name: Carregar perfil (Profiles/star_hyper_a14.env)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROFILE="Profiles/star_hyper_a14.env"
+          if [[ ! -f "$PROFILE" ]]; then
+            echo "::error::Perfil não encontrado: $PROFILE"
+            exit 2
+          fi
+          sed -i 's/\r$//' "$PROFILE"
+          while IFS= read -r raw || [[ -n "$raw" ]]; do
+            [[ -z "$raw" || "$raw" =~ ^[[:space:]]*# ]] && continue
+            if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
+              k="${raw%%=*}"; v="${raw#*=}"
+              v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+              echo "$k=$v" >> "$GITHUB_ENV"
+            fi
+          done < "$PROFILE"
+
+          # DEFCONFIG_NAME do perfil tem prioridade; se não vier, mantém input/fallback
+          if [[ -n "${DEFCONFIG_NAME:-}" ]]; then
+            echo "DEFCONFIG_NAME=${DEFCONFIG_NAME}" >> "$GITHUB_ENV"
+          else
+            echo "DEFCONFIG_NAME=vendor/gki_defconfig" >> "$GITHUB_ENV"
+          fi
+
+          # checagens mínimas
+          [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE ausente no perfil"; exit 2; }
+
+      # === NOVO: clona a fonte do kernel a partir do perfil, com fallback de branch/tag ===
+      - name: Clonar fonte do Kernel (usa perfil; robusto a branch/tag ausente)
+        shell: bash
         run: |
           set -euxo pipefail
-          # Seu repositório já está checado. Se precisar clonar outro, faça aqui.
+          rm -rf "${KERNEL_DIR}"
+
+          # Prioriza tag/commit (KERNEL_REF); se não houver, tenta branch; senão, branch padrão
+          if [[ -n "${KERNEL_REF:-}" ]]; then
+            git clone --depth 1 --branch "$KERNEL_REF" "$KERNEL_SOURCE" "${KERNEL_DIR}"
+          else
+            if [[ -n "${KERNEL_BRANCH:-}" ]] && git ls-remote --exit-code --heads "$KERNEL_SOURCE" "$KERNEL_BRANCH" >/dev/null 2>&1; then
+              git clone --depth 1 --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE" "${KERNEL_DIR}"
+            else
+              defb="$(git ls-remote --symref "$KERNEL_SOURCE" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
+              git clone --depth 1 --branch "$defb" "$KERNEL_SOURCE" "${KERNEL_DIR}"
+            fi
+          fi
+
+          cd "${KERNEL_DIR}"
+          # sanity check: precisa existir arch/arm64/configs
+          [[ -d arch/arm64/configs ]] || { echo "::error::Árvore do kernel inválida (faltou arch/arm64/configs)"; exit 2; }
 
           # Garanta diretório de build separado
-          mkdir -p "$KERNEL_DIR/out"
+          mkdir -p out
 
       - name: Saneamento de Makefiles/Config (CRLF/BOM/TAB)
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          # Evita problemas de final de linha acidental
+          # Evita problemas de final de linha acidental; usa arquivos versionados
           git ls-files | xargs -I{} sed -i 's/\r$//' {}
 
       - name: Compilar Kernel (defconfig + build, com log)
@@ -61,27 +109,12 @@ jobs:
             cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
             if [[ -n "$cand" ]]; then
               found="${cand#arch/arm64/configs/}"
-            else
-              prefix="${base%_defconfig}"
-              cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
-              [[ -z "$cand" ]] && cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
-              if [[ -n "$cand" ]]; then
-                found="${cand#arch/arm64/configs/}"
-              fi
             fi
           fi
 
           if [[ -z "$found" ]]; then
-            echo "::warning::Defconfig '${want}' não encontrado. Listando alguns candidatos:"
-            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -n 200 || true
-            for fb in vendor/gki_defconfig gki_defconfig; do
-              if [[ -f "arch/arm64/configs/$fb" ]]; then found="$fb"; echo "→ Usando fallback: $fb"; break; fi
-            done
-          fi
-
-          if [[ -z "$found" ]]; then
-            echo "::error::Nenhum defconfig compatível encontrado (queria '${want}')."
-            exit 2
+            echo "::warning::Defconfig '${want}' não encontrado. Usando fallback gki_defconfig…"
+            found="gki_defconfig"
           fi
 
           echo "→ Defconfig selecionado: $found"
@@ -92,9 +125,7 @@ jobs:
           # 2) Normaliza sem interação
           make O=out olddefconfig 2>&1 | tee -a build.log
 
-          # 3) **Overrides para contornar erro no zram (clang -Werror)**
-          #    Desabilitamos zram e zsmalloc e re-rodamos olddefconfig
-          #    (se você quiser zram, dá pra reverter isso depois e aplicar patch/flags)
+          # 3) Overrides para contornar erro no zram (clang -Werror)
           chmod +x ./scripts/config
           ./scripts/config --file out/.config -d CONFIG_ZRAM || true
           ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
