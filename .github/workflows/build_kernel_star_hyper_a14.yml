@@ -13,12 +13,12 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: "Checkout"
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: "Carregar perfil"
+      - name: Carregar perfil
         id: load_env
         shell: bash
         run: |
@@ -47,7 +47,7 @@ jobs:
           [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
           [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
 
-      - name: "(Opcional) Baixar LLVM/Clang do perfil"
+      - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
         shell: bash
         run: |
@@ -60,7 +60,7 @@ jobs:
           CLANG_DIR="$(find "$(pwd)" -maxdepth 1 -type d -name '*clang*' | head -n1)"
           echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
 
-      - name: "Instalar toolchain fallback (se não baixou clang)"
+      - name: Instalar toolchain fallback (se não baixou clang)
         if: ${{ env.CLANG_SOURCE == '' }}
         shell: bash
         run: |
@@ -70,12 +70,11 @@ jobs:
                                   libncurses5-dev git wget curl jq python3 ccache \
                                   clang lld llvm
 
-      - name: "Clonar fonte do Kernel (robusto a branch ausente)"
+      - name: Clonar fonte do Kernel (robusto a branch ausente)
         id: clone_kernel
         shell: bash
         run: |
           set -euxo pipefail
-          git --version
           rm -rf kernel-src || true
           if [[ -n "${KERNEL_REF:-}" ]]; then
             git clone --depth 1 --branch "$KERNEL_REF" "$KERNEL_SOURCE" kernel-src
@@ -89,104 +88,61 @@ jobs:
           fi
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: "Injetar KernelSU (normaliza layout em drivers/KernelSU)"
+      - name: Injetar KernelSU (normaliza layout em drivers/kernelsu + symlink CamelCase)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
           # Limpa tentativas anteriores
-          rm -rf KernelSU drivers/KernelSU drivers/kernelsu ksu_tmp || true
+          rm -rf KernelSU drivers/kernelsu drivers/KernelSU ksu_tmp || true
           mkdir -p drivers
 
           # Clona em tmp
           git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" ksu_tmp
 
-          # Descobre onde está o Makefile "real" do KernelSU dentro do repo
+          # Descobre onde estão Makefile/Kconfig "reais"
           CAND_DIR=""
-          for d in \
-            "ksu_tmp/KernelSU" \
-            "ksu_tmp/kernel" \
-            "ksu_tmp" ; do
-            if [[ -f "$d/Makefile" && -f "$d/Kconfig" ]]; then
-              CAND_DIR="$d"
-              break
-            fi
+          for d in "ksu_tmp/KernelSU" "ksu_tmp/kernel" "ksu_tmp"; do
+            if [[ -f "$d/Makefile" ]]; then CAND_DIR="$d"; break; fi
           done
+          [[ -n "$CAND_DIR" ]] || { echo "::error::Não achei Makefile do KernelSU no repositório"; exit 2; }
 
-          # Se não achou par Makefile+Kconfig, tente só Makefile e depois só Kconfig
-          if [[ -z "$CAND_DIR" ]]; then
-            if CAND_MK="$(find ksu_tmp -maxdepth 2 -type f -name Makefile | head -n1)"; then
-              CAND_DIR="$(dirname "$CAND_MK")"
-            fi
+          # Copia nivelado para drivers/kernelsu
+          mkdir -p drivers/kernelsu
+          cp -a "${CAND_DIR}/." drivers/kernelsu/
+
+          # Se Kconfig estiver em kernel/Kconfig, crie alias no topo
+          if [[ ! -f drivers/kernelsu/Kconfig && -f drivers/kernelsu/kernel/Kconfig ]]; then
+            cp -f drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
           fi
 
-          # Copia o conteúdo do diretório detectado para drivers/KernelSU/
-          mkdir -p drivers/KernelSU
-          if [[ -n "${CAND_DIR}" ]]; then
-            cp -a "${CAND_DIR}/." drivers/KernelSU/
-          else
-            echo "::error::Não localizei diretório com Makefile do KernelSU dentro do repositório clonado."
-            find ksu_tmp -maxdepth 2 -type f -name 'Makefile' -o -name 'Kconfig' | sed -n '1,200p' || true
-            exit 2
-          fi
+          # Symlink com maiúscula para satisfazer referências antigas
+          ln -sfn kernelsu drivers/KernelSU
 
-          # Se o Kconfig estiver em kernel/Kconfig, gera alias no topo
-          if [[ ! -f drivers/KernelSU/Kconfig && -f drivers/KernelSU/kernel/Kconfig ]]; then
-            cp -f drivers/KernelSU/kernel/Kconfig drivers/KernelSU/Kconfig
-          fi
+          # Ajusta Makefile e Kconfig (remove velhos, adiciona novos e deduplica)
+          sed -i '/obj-y[[:space:]]\+\+=\s*KernelSU\//d' drivers/Makefile || true
+          sed -i '/source\s*"drivers\/KernelSU\/Kconfig"/d' drivers/Kconfig || true
 
-          # Garante include e linkagem
-          grep -q "subdir-ccflags-y.*drivers/KernelSU/include" drivers/Makefile || \
-            echo 'subdir-ccflags-y += -I$(srctree)/drivers/KernelSU/include' >> drivers/Makefile
-          grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile || \
-            echo 'obj-y += KernelSU/' >> drivers/Makefile
-
-          # drivers/Kconfig → drivers/KernelSU/Kconfig
-          sed -i 's#KernelSU/Kconfig#drivers/KernelSU/Kconfig#g; s#drivers/kernelsu/Kconfig#drivers/KernelSU/Kconfig#g' drivers/Kconfig || true
-          grep -q 'drivers/KernelSU/Kconfig' drivers/Kconfig || \
-            printf '\nsource "drivers/KernelSU/Kconfig"\n' >> drivers/Kconfig
-
-          echo "── Verificando:"
-          ls -la drivers/KernelSU | sed -n '1,120p'
-          test -f drivers/KernelSU/Makefile || { echo "::error::Faltando drivers/KernelSU/Makefile"; exit 2; }
-          test -f drivers/KernelSU/Kconfig  || { echo "::error::Faltando drivers/KernelSU/Kconfig";  exit 2; }
-
-
-      - name: "Ajustar layout do KernelSU (links em drivers/* + includes)"
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-
-          # Garante que o repo KernelSU exista na raiz e tenha o Kconfig interno
-          if [[ ! -d KernelSU || ! -f KernelSU/kernel/Kconfig ]]; then
-            rm -rf KernelSU
-            git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
-          fi
-
-          # links que o kbuild espera (ambos por segurança: CamelCase e minúsculo)
-          rm -rf drivers/KernelSU drivers/kernelsu
-          mkdir -p drivers
-          ln -s ../KernelSU/kernel drivers/KernelSU
-          ln -s ../KernelSU/kernel drivers/kernelsu
-
-          # drivers/Kconfig → inclui o Kconfig do KernelSU
-          if ! grep -q 'drivers/KernelSU/Kconfig' drivers/Kconfig 2>/dev/null; then
-            printf '\nsource "drivers/KernelSU/Kconfig"\n' >> drivers/Kconfig
-          fi
-
-          # drivers/Makefile → inclui headers e diretório do KernelSU
           grep -q 'KernelSU/include' drivers/Makefile 2>/dev/null || \
             echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
 
-          grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile 2>/dev/null || \
-            echo 'obj-y += KernelSU/' >> drivers/Makefile
+          grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile 2>/dev/null || \
+            echo 'obj-y += kernelsu/' >> drivers/Makefile
 
-          echo "→ Verificando:"
-          ls -la drivers/KernelSU | sed -n '1,80p'
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null; then
+            printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+          fi
 
-      - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
+          awk '!x[$0]++' drivers/Makefile > .mk && mv .mk drivers/Makefile
+          awk '!x[$0]++' drivers/Kconfig  > .kc && mv .kc drivers/Kconfig
+
+          echo "── Verificando drivers/kernelsu:"
+          ls -la drivers/kernelsu | sed -n '1,120p'
+          test -f drivers/kernelsu/Makefile || { echo "::error::Faltando drivers/kernelsu/Makefile"; exit 2; }
+          test -f drivers/kernelsu/Kconfig  || { echo "::error::Faltando drivers/kernelsu/Kconfig";  exit 2; }
+
+      - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         shell: bash
         run: |
           set -euxo pipefail
@@ -197,7 +153,18 @@ jobs:
             | cut -d: -f1 \
             | xargs -r sed -i 's/\r$//'
 
-      - name: "Compilar Kernel (defconfig + build, com log)"
+      - name: Hotfix EROFS (unused variable com -Werror)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          f="fs/erofs/inode.c"
+          if [[ -f "$f" ]] && grep -qE '\bloff_t[[:space:]]+off;' "$f"; then
+            sed -i 's/\bloff_t[[:space:]]\+off;/__maybe_unused loff_t off;/' "$f"
+            echo "→ Hotfix aplicado em $f"
+          fi
+
+      - name: Compilar Kernel (defconfig + build, com log)
         shell: bash
         run: |
           set -euo pipefail
@@ -207,6 +174,7 @@ jobs:
             export PATH="${CLANG_DIR}/bin:${PATH}"
           fi
 
+          # === Detecta defconfig automaticamente ===
           want="${DEFCONFIG_NAME}"
           base="${want##*/}"
           path1="arch/arm64/configs/${want}"
@@ -243,6 +211,7 @@ jobs:
 
           echo "→ Defconfig selecionado: $found"
           make O=out "$found" V=1 2>&1 | tee build.log
+          # evita prompts do kconfig
           make O=out olddefconfig 2>&1 | tee -a build.log
 
           # Build principal com log completo
@@ -260,7 +229,7 @@ jobs:
 
           ls -la out/arch/arm64/boot || true
 
-      - name: "Diagnóstico de falha (se houver)"
+      - name: Diagnóstico de falha (se houver)
         if: failure()
         shell: bash
         run: |
@@ -270,12 +239,12 @@ jobs:
           head -n 200 build.log || true
           echo "=== TAIL do log (200 linhas) ==="
           tail -n 200 build.log || true
-          echo "=== Erros encontrados (contexto ±3 linhas) ==="
-          grep -nEi -C3 '(^|\s)(error:|fatal error:|undefined reference|No rule to make target)' build.log || true
-          echo "=== Defconfig efetivo e .config ==="
+          echo "=== Erros encontrados (contexto ±3) ==="
+          grep -nEi -C3 '(^|\s)(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
+          echo "=== .config (parcial) ==="
           test -f out/.config && sed -n '1,120p' out/.config || true
 
-      - name: "Upload de logs e .config"
+      - name: Upload de logs e .config
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -284,7 +253,7 @@ jobs:
             ${{ env.KERNEL_DIR }}/build.log
             ${{ env.KERNEL_DIR }}/out/.config
 
-      - name: "Empacotar com AnyKernel3"
+      - name: Empacotar com AnyKernel3
         if: success()
         shell: bash
         run: |
@@ -303,7 +272,7 @@ jobs:
           zip -r9 "../kernel-${ROM_TEXT:-build}.zip" . -x "*.git*"
           echo "ZIP_PATH=$GITHUB_WORKSPACE/kernel-${ROM_TEXT:-build}.zip" >> "$GITHUB_ENV"
 
-      - name: "Publicar artefato"
+      - name: Publicar artefato
         if: success()
         uses: actions/upload-artifact@v4
         with:
