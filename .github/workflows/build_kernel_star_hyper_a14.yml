@@ -89,48 +89,38 @@ jobs:
           fi
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: "Injetar KernelSU (robusto; garante KernelSU/Kconfig)"
+      - name: "Injetar KernelSU (em drivers/KernelSU)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          need_clone=0
-          if [[ -d KernelSU ]]; then
-            if [[ ! -d KernelSU/.git ]] || { [[ ! -f KernelSU/Kconfig ]] && [[ ! -f KernelSU/kernel/Kconfig ]] ; }; then
-              echo "→ KernelSU existe mas está vazio/submódulo. Recriando…"
-              rm -rf KernelSU
-              need_clone=1
-            fi
-          else
-            need_clone=1
+
+          # Limpa tentativas anteriores (raiz ou drivers/kernelsu)
+          rm -rf KernelSU drivers/KernelSU drivers/kernelsu || true
+          mkdir -p drivers
+
+          # Clona KernelSU na pasta que o Kbuild está buscando
+          git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" drivers/KernelSU
+
+          # Alguns branches têm Kconfig em kernel/Kconfig – cria o alias no topo
+          if [[ ! -f drivers/KernelSU/Kconfig && -f drivers/KernelSU/kernel/Kconfig ]]; then
+            cp -f drivers/KernelSU/kernel/Kconfig drivers/KernelSU/Kconfig
           fi
-          if [[ "$need_clone" -eq 1 ]]; then
-            git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
-          else
-            echo "KernelSU já presente e utilizável."
-          fi
-          if ! grep -q "subdir-ccflags-y.*KernelSU/include" drivers/Makefile 2>/dev/null || true; then
-            echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
-          fi
-          if ! grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile 2>/dev/null || true; then
+
+          # Garante include e linkagem no drivers/Makefile
+          grep -q "subdir-ccflags-y.*drivers/KernelSU/include" drivers/Makefile || \
+            echo 'subdir-ccflags-y += -I$(srctree)/drivers/KernelSU/include' >> drivers/Makefile
+          grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile || \
             echo 'obj-y += KernelSU/' >> drivers/Makefile
-          fi
-          if [[ ! -f KernelSU/Kconfig ]]; then
-            if [[ -f KernelSU/kernel/Kconfig ]]; then
-              cp -f KernelSU/kernel/Kconfig KernelSU/Kconfig
-              echo "→ Copiado KernelSU/kernel/Kconfig -> KernelSU/Kconfig"
-            else
-              echo "::error::Não encontrei Kconfig do KernelSU em KernelSU/Kconfig nem KernelSU/kernel/Kconfig"
-              ls -la KernelSU || true
-              exit 2
-            fi
-          fi
-          sed -i 's#drivers/kernelsu/Kconfig#KernelSU/Kconfig#g; s#KernelSU/kernel/Kconfig#KernelSU/Kconfig#g' drivers/Kconfig || true
-          if ! grep -q 'KernelSU/Kconfig' drivers/Kconfig 2>/dev/null; then
-            printf '\nsource "KernelSU/Kconfig"\n' >> drivers/Kconfig
-          fi
-          echo "── Conteúdo de KernelSU/:"
-          ls -la KernelSU || true
+
+          # drivers/Kconfig deve apontar para drivers/KernelSU/Kconfig
+          sed -i 's#KernelSU/Kconfig#drivers/KernelSU/Kconfig#g; s#drivers/kernelsu/Kconfig#drivers/KernelSU/Kconfig#g' drivers/Kconfig || true
+          grep -q 'drivers/KernelSU/Kconfig' drivers/Kconfig || \
+            printf '\nsource "drivers/KernelSU/Kconfig"\n' >> drivers/Kconfig
+
+          echo "── Conteúdo de drivers/KernelSU:"
+          ls -la drivers/KernelSU | sed -n '1,80p'
+
 
       - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
         shell: bash
