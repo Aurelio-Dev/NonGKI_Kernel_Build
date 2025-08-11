@@ -163,37 +163,98 @@ jobs:
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # === Resolver defconfig ===
-          want="${DEFCONFIG_NAME}"
+          # =========================
+          # Resolver DEFCONFIG (robusto)
+          # =========================
+          want="${DEFCONFIG_NAME#./}"          # remove ./ se vier
+          want="${want#arch/arm64/configs/}"   # normaliza se vier com prefixo
           base="${want##*/}"
+          base_no_vendor="${base#vendor/}"     # ex.: vendor/foo_defconfig -> foo_defconfig
+
           found=""
+
+          # 1) Caminho exato informado
           if [[ -f "arch/arm64/configs/$want" ]]; then
-            found="$base"
-          else
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            [[ -n "$cand" ]] && found="$(basename "$cand")"
+            found="$want"
           fi
-          [[ -z "$found" ]] && { echo "::error::Defconfig '$want' não encontrado"; exit 2; }
-          echo "→ Defconfig: $found"
 
-          # === Gera .config de forma não-interativa ===
-          make O=out ARCH=arm64 "$found" V=1        2>&1 | tee build.log
-          make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
+          # 2) Se não achou, tente variações do mesmo nome
+          if [[ -z "$found" ]]; then
+            for try in \
+              "$base" \
+              "vendor/$base" \
+              "$base_no_vendor" \
+              "vendor/$base_no_vendor"
+            do
+              if [[ -f "arch/arm64/configs/$try" ]]; then
+                found="$try"
+                break
+              fi
+            done
+          fi
 
-          # Desliga Werror e zram/zsmalloc (para evitar abortos por warnings)
+          # 3) Se ainda não achou, procure por arquivo com o mesmo *basename* no repositório
+          if [[ -z "$found" ]]; then
+            cand="$(git ls-files arch/arm64/configs | grep -E "/(${base}|${base_no_vendor})$" | head -n1 || true)"
+            if [[ -n "$cand" ]]; then
+              found="${cand#arch/arm64/configs/}"
+            fi
+          fi
+
+          # 4) Último recurso: fallbacks comuns de GKI
+          if [[ -z "$found" ]]; then
+            for fb in "vendor/gki_defconfig" "gki_defconfig"; do
+              if [[ -f "arch/arm64/configs/$fb" ]]; then
+                echo "::warning::Defconfig '${want}' não encontrado. Usando fallback: $fb"
+                found="$fb"
+                break
+              fi
+            done
+          fi
+
+          # 5) Se mesmo assim não achou, loga candidatos e falha explicitamente
+          if [[ -z "$found" ]]; then
+            echo "::error::Nenhum defconfig compatível encontrado para '${want}'."
+            echo "Alguns defconfigs disponíveis:"
+            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -n 200 || true
+            exit 2
+          fi
+
+          echo "→ Defconfig selecionado: $found"
+
+          # =========================
+          # Geração de .config (não-interativa)
+          # =========================
+          # Limpeza esquemática já foi feita antes; garantimos OUT
+          mkdir -p out
+
+          # 1) defconfig base
+          make O=out ARCH=arm64 "$found" V=1      2>&1 | tee build.log
+
+          # 2) sincroniza sem interação
+          make O=out ARCH=arm64 olddefconfig      2>&1 | tee -a build.log
+
+          # 3) Desliga Werror e zram/zsmalloc para evitar abortos por warnings
           chmod +x ./scripts/config
-          ./scripts/config --file out/.config -d CONFIG_ZRAM || true
-          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
-          ./scripts/config --file out/.config -d CONFIG_WERROR || true
-          ./scripts/config --file out/.config -d CONFIG_CC_WERROR || true
-          make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
+          ./scripts/config --file out/.config -d CONFIG_ZRAM        || true
+          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC    || true
+          ./scripts/config --file out/.config -d CONFIG_WERROR      || true
+          ./scripts/config --file out/.config -d CONFIG_CC_WERROR   || true
+          make O=out ARCH=arm64 olddefconfig      2>&1 | tee -a build.log
 
-          # === Build ===
-          # Sinalizadores extras para garantir que warning != erro em toolchains mais chatos
+          # (opcional) mostra estados
+          grep -E 'CONFIG_(ZRAM|ZSMALLOC|WERROR|CC_WERROR)=' out/.config || true
+
+          # =========================
+          # Build
+          # =========================
+          # Warnings não viram erro; força LLVM/Clang; host em clang também
           KBUILD_CFLAGS="-Wno-error" KCFLAGS="-Wno-error" WERROR=0 \
           make -j"$(nproc)" \
                O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
-               HOSTCC=clang HOSTCXX=clang++ V=1        2>&1 | tee -a build.log
+               HOSTCC=clang HOSTCXX=clang++ V=1 \
+               2>&1 | tee -a build.log
+
 
       - name: Diagnóstico de falha (se houver)
         if: failure()
