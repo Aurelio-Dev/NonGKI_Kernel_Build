@@ -18,11 +18,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Lê o perfil, normaliza CRLF, exporta agora e persiste para próximos steps
       - name: "Carregar perfil"
         id: load_env
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p Profiles
           PROFILE_PATH="Profiles/${{ github.event.inputs.PROFILE_NAME }}"
           if [[ ! -f "${PROFILE_PATH}" ]]; then
@@ -30,13 +32,16 @@ jobs:
             ls -la Profiles || true
             exit 2
           fi
+
           echo "→ Usando perfil: ${PROFILE_PATH}"
           sed -i 's/\r$//' "${PROFILE_PATH}"
+
           while IFS= read -r raw || [[ -n "$raw" ]]; do
             [[ -z "$raw" ]] && continue
             [[ "$raw" =~ ^[[:space:]]*# ]] && continue
             if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
-              k="${raw%%=*}"; v="${raw#*=}"
+              k="${raw%%=*}"
+              v="${raw#*=}"
               v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
               k="${k%$'\r'}"; v="${v%$'\r'}"
               export "$k=$v"
@@ -44,6 +49,7 @@ jobs:
               printf '  %s=%s\n' "$k" "$v"
             fi
           done < "${PROFILE_PATH}"
+
           [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
           [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
 
@@ -77,6 +83,7 @@ jobs:
           set -euxo pipefail
           git --version
           rm -rf kernel-src || true
+
           if [[ -n "${KERNEL_REF:-}" ]]; then
             git clone --depth 1 --branch "$KERNEL_REF" "$KERNEL_SOURCE" kernel-src
           else
@@ -87,19 +94,31 @@ jobs:
               git clone --depth 1 --branch "$default_branch" "$KERNEL_SOURCE" kernel-src
             fi
           fi
+
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: "Injetar KernelSU (garante KernelSU/Kconfig)"
+      - name: "Injetar KernelSU (robusto a submódulo vazio; garante KernelSU/Kconfig)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          # Clona KernelSU na raiz (padrão)
+          # Se existir, checar se é repo válido e contém Kconfig
+          need_clone=0
           if [[ -d KernelSU ]]; then
-            echo "KernelSU já presente."
+            if [[ ! -d KernelSU/.git ]] || { [[ ! -f KernelSU/Kconfig ]] && [[ ! -f KernelSU/kernel/Kconfig ]] ; }; then
+              echo "→ KernelSU existe mas está vazio/submódulo não inicializado. Recriando…"
+              rm -rf KernelSU
+              need_clone=1
+            fi
           else
+            need_clone=1
+          fi
+
+          if [[ "$need_clone" -eq 1 ]]; then
             git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
+          else
+            echo "KernelSU já presente e utilizável."
           fi
 
           # Garante include e linkagem
@@ -136,6 +155,7 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          # Versão rápida: processa apenas arquivos de TEXTO em lote
           git ls-files -z \
             | xargs -0 file --mime-type \
             | grep 'text/' \
@@ -157,13 +177,16 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+
           export ARCH=arm64 SUBARCH=arm64 LC_ALL=C
           if [[ -n "${CLANG_DIR:-}" && -d "${CLANG_DIR}" ]]; then
             export PATH="${CLANG_DIR}/bin:${PATH}"
           fi
+
           make O=out "${DEFCONFIG_NAME}"
           make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+
           ls -la out/arch/arm64/boot || true
 
       - name: "Empacotar com AnyKernel3"
@@ -173,6 +196,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           rm -rf AnyKernel3
           git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
+
           KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
           if [[ ! -f "$KIMG" ]]; then
             echo "::error::Kernel Image não encontrado em $KIMG"
