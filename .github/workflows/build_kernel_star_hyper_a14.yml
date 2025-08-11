@@ -38,9 +38,7 @@ jobs:
           python3 --version || true
           git --version
 
-      # --- CORREÇÃO PRINCIPAL ---
-      # 1) Normaliza quebras de linha do arquivo .env para LF
-      # 2) Parse robusto das variáveis (ignora # e vazias, remove \r e aspas)
+      # Carrega o .env com parser robusto (e exporta no shell atual)
       - name: Carregar perfil
         id: load_env
         run: |
@@ -49,36 +47,52 @@ jobs:
           test -f "Profiles/${PROFILE_NAME}"
           echo "→ Perfil: Profiles/${PROFILE_NAME}"
 
-          # Normaliza para LF (remove CR dos finais de linha)
+          # Normaliza CRLF e remove BOM
           sed -i 's/\r$//' "Profiles/${PROFILE_NAME}"
-
-          # Caso exista BOM no início
           perl -i -pe 'BEGIN{binmode(STDIN);binmode(STDOUT)} s/^\xEF\xBB\xBF//' "Profiles/${PROFILE_NAME}"
 
-          # Exporta chaves KEY=VALUE válidas para o ambiente do job
-          while IFS= read -r line; do
-            # tira CR remanescente, espaços das pontas
-            line="${line%$'\r'}"
-            line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          # Funções para aparar espaços
+          trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 
-            # ignora vazias e comentários
-            [[ -z "$line" || "$line" =~ ^# ]] && continue
+          # Lê o .env, exporta no shell e grava em $GITHUB_ENV
+          while IFS= read -r raw; do
+            # Remove CR e espaços das pontas
+            raw="${raw%$'\r'}"
+            raw="$(trim "$raw")"
 
-            # só aceita formato chave=valor
-            if [[ "$line" == *=* ]]; then
-              k="${line%%=*}"
-              v="${line#*=}"
+            # Ignora vazias e comentários
+            [[ -z "$raw" || "$raw" =~ ^# ]] && continue
 
-              # remove aspas e CR de valor
-              v="${v%$'\r'}"
-              v="${v%\"}"
-              v="${v#\"}"
+            # Remove prefixo 'export ' se houver
+            raw="${raw#export }"
+            raw="$(trim "$raw")"
 
-              echo "${k}=${v}" >> "$GITHUB_ENV"
-            fi
+            # Faz split no primeiro '='
+            case "$raw" in
+              *=*)
+                k="${raw%%=*}"
+                v="${raw#*=}"
+
+                k="$(trim "$k")"
+                v="$(trim "$v")"
+
+                # remove aspas ao redor do valor
+                [[ "$v" =~ ^\".*\"$ ]] && v="${v:1:-1}"
+                [[ "$v" =~ ^\'.*\'$ ]] && v="${v:1:-1}"
+
+                # exporta pro shell atual
+                export "$k=$v"
+                # e disponibiliza pros próximos passos
+                printf '%s=%s\n' "$k" "$v" >> "$GITHUB_ENV"
+                ;;
+              *)
+                # linha sem '=', ignora
+                continue
+                ;;
+            esac
           done < "Profiles/${PROFILE_NAME}"
 
-          # Guard-rails
+          # Guard-rails (agora as variáveis existem neste passo também)
           : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
           : "${KERNEL_BRANCH:?KERNEL_BRANCH não definido no perfil}"
           : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
@@ -114,10 +128,7 @@ jobs:
           cd device_kernel
           echo "KERNEL_TREE=$(pwd)" >> $GITHUB_ENV
 
-      # ---------------------------------------------------------
-      #  BLOCO KernelSU — robusto e idempotente
-      #  Usa KERNELSU_SOURCE/KERNELSU_BRANCH do perfil; se não vier, define padrão
-      # ---------------------------------------------------------
+      # KernelSU (robusto e idempotente)
       - name: Injetar KernelSU no tree do kernel
         run: |
           set -euxo pipefail
@@ -127,30 +138,22 @@ jobs:
           KS_SRC="${KERNELSU_SOURCE:-https://github.com/rsuntk/KernelSU.git}"
           KS_BR="${KERNELSU_BRANCH:-main}"
 
-          echo "→ Limpando destino para evitar conflito (arquivo/symlink/dir): $KS_DIR"
+          echo "→ Limpando destino: $KS_DIR"
           rm -rf "$KS_DIR"
           mkdir -p "$KS_DIR"
 
-          echo "→ Clonando KernelSU: $KS_SRC (branch: $KS_BR)"
+          echo "→ Clonando KernelSU: $KS_SRC (branch $KS_BR)"
           rm -rf /tmp/KernelSU
           git clone --depth=1 -b "$KS_BR" "$KS_SRC" /tmp/KernelSU
 
-          echo "→ Copiando KernelSU para $KS_DIR"
+          echo "→ Copiando para $KS_DIR"
           cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
 
-          echo "→ Integrando Kconfig e Makefile"
+          echo "→ Integrando no Kconfig/Makefile"
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
-
           grep -q 'obj-$(CONFIG_KSU)      += kernelsu/' drivers/Makefile || \
             echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
-
-      # Opcional: habilitar CONFIG_KSU=y direto na defconfig
-      # - name: Habilitar CONFIG_KSU=y na defconfig
-      #   run: |
-      #     set -euxo pipefail
-      #     cd "$KERNEL_TREE"
-      #     grep -q "^CONFIG_KSU=y" "$DEFCONFIG_NAME" || echo "CONFIG_KSU=y" >> "$DEFCONFIG_NAME"
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
@@ -159,7 +162,7 @@ jobs:
           find . -type f \( -name "Makefile" -o -name "Kconfig" -o -name "*.mk" -o -name "*.cfg" \) \
             -print0 | xargs -0 sed -i 's/\r$//'
 
-      # Hotfix específico (millet): inclui binder_internal por "aspas" no caminho relativo
+      # Hotfix opcional do millet (include com "aspas")
       - name: Hotfix:binder_gki.c include path (millet)
         if: ${{ env.TARGET_DEVICE == 'millet' || env.TARGET_DEVICE == 'millet_global' || env.TARGET_DEVICE == 'milletpro' }}
         run: |
@@ -180,10 +183,8 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
 
-          # defconfig
           make -j"$(nproc)" "${DEFCONFIG_NAME}"
 
-          # build
           make -j"$(nproc)" \
             ${LLVM:+LLVM=1} \
             ${LLVM_IAS:+LLVM_IAS=1} \
@@ -191,7 +192,6 @@ jobs:
             ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
             ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
 
-          # artefatos de interesse
           mkdir -p "$GITHUB_WORKSPACE/out"
           for f in \
             arch/arm64/boot/Image.gz-dtb \
