@@ -88,7 +88,7 @@ jobs:
           fi
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: Injetar KernelSU (normaliza layout em drivers/kernelsu + symlink CamelCase)
+      - name: Injetar KernelSU (drivers/kernelsu + symlink KernelSU)
         shell: bash
         run: |
           set -euxo pipefail
@@ -203,69 +203,27 @@ jobs:
 
           echo "→ Defconfig selecionado: $found"
           make O=out "$found" V=1 2>&1 | tee build.log
-          make O=out olddefconfig 2>&1 | tee -a build.log
+
+          # === Anti-interativo: responda Kconfig e congele a .config ===
+          if [[ -x ./scripts/config ]]; then
+            ./scripts/config --file out/.config \
+              -e COMPAT \
+              -e KUSER_HELPERS \
+              -e COMPAT_VDSO \
+              -d SHADOW_CALL_STACK \
+              -e LTO_NONE \
+              -d LTO_CLANG \
+              -e RELR \
+              -e INIT_STACK_NONE \
+              -d INIT_STACK_ALL_PATTERN \
+              -d INIT_STACK_ALL_ZERO \
+              -e INIT_ON_ALLOC_DEFAULT_ON \
+              -d INIT_ON_FREE_DEFAULT_ON || true
+          fi
+          yes "" | make O=out olddefconfig 2>&1 | tee -a build.log
+          export KCONFIG_NOSILENTUPDATE=1
 
           set +e
           make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 V=1 \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-               KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function" \
-               2>&1 | tee -a build.log
-          MAKE_RC=${PIPESTATUS[0]}
-          set -e
-
-          if [[ $MAKE_RC -ne 0 ]]; then
-            echo "::error::Compilação falhou. Verificando log…"
-            exit $MAKE_RC
-          fi
-
-          ls -la out/arch/arm64/boot || true
-
-      - name: Diagnóstico de falha (se houver)
-        if: failure()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-          echo "=== HEAD do log (200 linhas) ==="
-          head -n 200 build.log || true
-          echo "=== TAIL do log (200 linhas) ==="
-          tail -n 200 build.log || true
-          echo "=== Erros encontrados (contexto ±3) ==="
-          grep -nEi -C3 '(^|\s)(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
-          echo "=== .config (parcial) ==="
-          test -f out/.config && sed -n '1,120p' out/.config || true
-
-      - name: Upload de logs e .config
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-kernel-logs
-          path: |
-            ${{ env.KERNEL_DIR }}/build.log
-            ${{ env.KERNEL_DIR }}/out/.config
-
-      - name: Empacotar com AnyKernel3
-        if: success()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE"
-          rm -rf AnyKernel3
-          git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
-          KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
-          if [[ ! -f "$KIMG" ]]; then
-            echo "::error::Kernel Image não encontrado em $KIMG"
-            ls -la "$KERNEL_DIR/out/arch/arm64/boot" || true
-            exit 2
-          fi
-          cp -fv "$KIMG" AnyKernel3/
-          cd AnyKernel3
-          zip -r9 "../kernel-${ROM_TEXT:-build}.zip" . -x "*.git*"
-          echo "ZIP_PATH=$GITHUB_WORKSPACE/kernel-${ROM_TEXT:-build}.zip" >> "$GITHUB_ENV"
-
-      - name: Publicar artefato
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-${{ env.ROM_TEXT || 'build' }}
-          path: ${{ env.ZIP_PATH }}
+               KCFLAGS="-Wno-error=unus
