@@ -179,113 +179,72 @@ jobs:
             fi
           done
 
+      # ========= BLOCO NOVO: resolver defconfig com fallbacks e compilar =========
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # 1) Defconfig (com descoberta robusta, igual já fazemos)
-          want="${DEFCONFIG_NAME}"
+          # ========= Resolver DEFCONFIG com fallbacks =========
+          want="${DEFCONFIG_NAME:-vendor/gki_defconfig}"
           base="${want##*/}"
-          path1="arch/arm64/configs/${want}"
-          found=""
-          if [[ -f "$path1" ]]; then
-            found="$want"
-          else
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
-          fi
-          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
-          echo "→ Usando defconfig: $found"
-
-          # 2) Gera defconfig + sincroniza sem interação
-          make O=out "$found" V=1 2>&1 | tee build.log
-          yes "" | make O=out olddefconfig 2>&1 | tee -a build.log
-
-          # 3) Força overrides anti-ZRAM (contorna -Werror no zram_drv.c)
-          chmod +x ./scripts/config
-          ./scripts/config --file out/.config -d CONFIG_ZRAM || true
-          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
-          yes "" | make O=out olddefconfig 2>&1 | tee -a build.log
-
-          # (opcional) confirme que ficou desabilitado
-          grep -E 'CONFIG_ZRAM|CONFIG_ZSMALLOC' out/.config || true
-
-          # 4) Build
-          set +e
-          make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 V=1 \
-               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-               2>&1 | tee -a build.log
-          rc=${PIPESTATUS[0]}
-          set -e
-          exit $rc
-
-      
-      - name: Compilar Kernel (defconfig + build, com log)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$KERNEL_DIR"
-
-          want="${DEFCONFIG_NAME}"
-          base="${want##*/}"
-          path1="arch/arm64/configs/${want}"
           found=""
 
-          # Resolver defconfig com fallback
-          if [[ -f "$path1" ]]; then
-            found="$want"
-          else
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            if [[ -n "$cand" ]]; then
-              found="${cand#arch/arm64/configs/}"
-            else
-              prefix="${base%_defconfig}"
-              cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
-              [[ -z "$cand" ]] && cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
-              if [[ -n "$cand" ]]; then
-                found="${cand#arch/arm64/configs/}"
-              fi
+          try_list=(
+            "$want"
+            "vendor/${base}"
+            "${base}"
+            "vendor/gki_defconfig"
+            "gki_defconfig"
+          )
+
+          for cand in "${try_list[@]}"; do
+            if [[ -f "arch/arm64/configs/$cand" ]]; then
+              found="$cand"; break
             fi
+          done
+
+          # Fuzzy search final
+          if [[ -z "$found" ]]; then
+            cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
+            if [[ -z "$cand" ]]; then
+              prefix="${base%_defconfig}"
+              cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
+            fi
+            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
           fi
 
           if [[ -z "$found" ]]; then
-            echo "::warning::Defconfig '${want}' não encontrado. Usando fallback gki_defconfig…"
-            found="gki_defconfig"
+            echo "::warning::Defconfig '${want}' não encontrado. Alguns candidatos:"
+            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | sort | head -n 200 || true
+            echo "::error::Sem defconfig válido; ajuste o input ou adicione o arquivo."
+            exit 2
           fi
 
-          echo "→ Defconfig selecionado: $found"
+          echo "→ Usando defconfig: $found"
 
-          # 1) Gera defconfig (FORÇA ARM64)
+          # ========= Gera defconfig + sincroniza =========
           make O=out ARCH=arm64 "$found" V=1 2>&1 | tee build.log
-
-          # 2) Normaliza sem interação (sem usar 'yes' para não gerar Broken pipe)
           make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
           make O=out ARCH=arm64 syncconfig    2>&1 | tee -a build.log
 
-          # 3) Overrides opcionais (zram/zsmalloc) e consolida
+          # ========= Overrides anti-ZRAM (opcional) =========
           chmod +x ./scripts/config
           ./scripts/config --file out/.config -d CONFIG_ZRAM     || true
           ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
           make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
 
-          # 4) Build principal — LLVM + Clang, fixando host em Clang também
+          # ========= Build =========
           set +e
           make -j"$(nproc)" \
                O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ V=1 \
                2>&1 | tee -a build.log
-          MAKE_RC=${PIPESTATUS[0]}
+          rc=${PIPESTATUS[0]}
           set -e
-
-          if [[ $MAKE_RC -ne 0 ]]; then
-            echo "::error::Compilação falhou. Verificando log…"
-            exit $MAKE_RC
-          fi
-
-          ls -la out/arch/arm64/boot || true
+          exit $rc
 
       - name: Diagnóstico de falha (se houver)
         if: failure()
