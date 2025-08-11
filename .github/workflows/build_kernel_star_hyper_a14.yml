@@ -1,286 +1,160 @@
-name: Build Kernel Star Hyper A14
+name: Build Kernel • Star Hyper A14 (KernelSU)
 
 on:
   workflow_dispatch:
-    inputs:
-      PROFILE_NAME:
-        description: "Nome do arquivo de perfil em Profiles/ (ex.: star_hyper_a14.env)"
-        required: true
-        default: "star_hyper_a14.env"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
+    env:
+      KERNEL_DIR: kernel-src
+      OUT_DIR: kernel-src/out
+      ANYKERNEL_DIR: AnyKernel3
+      ARCH: arm64
+      SUBARCH: arm64
+      # ajuste se tiver um defconfig próprio; se não existir, cai no gki_defconfig
+      DEFCONFIG: vendor/star_hyper_a14_defconfig
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          submodules: false
+          fetch-depth: 1
 
-      - name: Carregar perfil
-        id: load_env
-        shell: bash
+      - name: Dependências
         run: |
-          set -euo pipefail
-          mkdir -p Profiles
-          PROFILE_PATH="Profiles/${{ github.event.inputs.PROFILE_NAME }}"
-          if [[ ! -f "${PROFILE_PATH}" ]]; then
-            echo "::error::Arquivo de perfil não encontrado: ${PROFILE_PATH}"
-            ls -la Profiles || true
-            exit 2
-          fi
-          echo "→ Usando perfil: ${PROFILE_PATH}"
-          sed -i 's/\r$//' "${PROFILE_PATH}"
-          while IFS= read -r raw || [[ -n "$raw" ]]; do
-            [[ -z "$raw" ]] && continue
-            [[ "$raw" =~ ^[[:space:]]*# ]] && continue
-            if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
-              k="${raw%%=*}"; v="${raw#*=}"
-              v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
-              k="${k%$'\r'}"; v="${v%$'\r'}"
-              export "$k=$v"
-              echo "$k=$v" >> "$GITHUB_ENV"
-              printf '  %s=%s\n' "$k" "$v"
-            fi
-          done < "${PROFILE_PATH}"
-          [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
-          [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
-
-      - name: (Opcional) Baixar LLVM/Clang do perfil
-        if: ${{ env.CLANG_SOURCE != '' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y xz-utils curl
-          mkdir -p toolchains && cd toolchains
-          curl -L "$CLANG_SOURCE" -o clang.tar.xz
-          tar -xJf clang.tar.xz
-          CLANG_DIR="$(find "$(pwd)" -maxdepth 1 -type d -name '*clang*' | head -n1)"
-          echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache clang-14 flex git libssl-dev \
+            libelf-dev lld-14 llvm-14 dwarves libncurses5-dev libncursesw5-dev \
+            python3 zip unzip rsync cmake pkg-config libyaml-dev
 
-      - name: Instalar toolchain fallback (se não baixou clang)
-        if: ${{ env.CLANG_SOURCE == '' }}
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y build-essential bc bison flex libssl-dev \
-                                  libncurses5-dev git wget curl jq python3 ccache \
-                                  clang lld llvm
+          # Aponta clang/lld padrão para a versão 14 (evita binutils antigos quebrando LSE, etc)
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 140 \
+                                   --slave /usr/bin/clang++ clang++ /usr/bin/clang++-14 \
+                                   --slave /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-14 \
+                                   --slave /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-14 \
+                                   --slave /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-14 \
+                                   --slave /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-14 \
+                                   --slave /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-14
 
+      # === Clone da fonte do kernel (mantenha sua origem atual; exemplo robusto) ===
       - name: Clonar fonte do Kernel (robusto a branch ausente)
-        id: clone_kernel
-        shell: bash
         run: |
           set -euxo pipefail
-          rm -rf kernel-src || true
-          if [[ -n "${KERNEL_REF:-}" ]]; then
-            git clone --depth 1 --branch "$KERNEL_REF" "$KERNEL_SOURCE" kernel-src
-          else
-            if [[ -n "${KERNEL_BRANCH:-}" ]] && git ls-remote --exit-code --heads "$KERNEL_SOURCE" "$KERNEL_BRANCH" >/dev/null 2>&1; then
-              git clone --depth 1 --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel-src
-            else
-              default_branch="$(git ls-remote --symref "$KERNEL_SOURCE" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
-              git clone --depth 1 --branch "$default_branch" "$KERNEL_SOURCE" kernel-src
-            fi
+          if [ ! -d "${KERNEL_DIR}" ]; then
+            # Troque a URL/branch abaixo pela sua origem real
+            git clone --depth=1 https://github.com/arter97/android_kernel_common ${KERNEL_DIR} || true
           fi
-          echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
+          cd "${KERNEL_DIR}"
+          git rev-parse --is-inside-work-tree
 
-      - name: Injetar KernelSU (drivers/kernelsu + symlink KernelSU)
-        shell: bash
+      # === Injeção real do KernelSU (código + headers) ===
+      - name: Injetar KernelSU (drivers/kernelsu + headers)
+        working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euxo pipefail
-          cd "$KERNEL_DIR"
 
-          rm -rf KernelSU drivers/kernelsu drivers/KernelSU ksu_tmp || true
+          # Clona KernelSU temporariamente
+          rm -rf ../_ksu_tmp
+          git clone --depth=1 https://github.com/tiann/KernelSU ../_ksu_tmp
+
+          # Copia a pasta drivers/kernelsu
           mkdir -p drivers
+          rsync -a ../_ksu_tmp/kernel/drivers/kernelsu/ drivers/kernelsu/
 
-          git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" ksu_tmp
+          # Copia os headers necessários (ksu*.h)
+          rsync -a --include="ksu*.h" --include="*/" --exclude="*" \
+            ../_ksu_tmp/kernel/include/linux/ include/linux/
 
-          CAND_DIR=""
-          for d in "ksu_tmp/KernelSU" "ksu_tmp/kernel" "ksu_tmp"; do
-            if [[ -f "$d/Makefile" ]]; then CAND_DIR="$d"; break; fi
-          done
-          [[ -n "$CAND_DIR" ]] || { echo "::error::Não achei Makefile do KernelSU no repositório"; exit 2; }
+          rm -rf ../_ksu_tmp
 
-          mkdir -p drivers/kernelsu
-          cp -a "${CAND_DIR}/." drivers/kernelsu/
-
-          if [[ ! -f drivers/kernelsu/Kconfig && -f drivers/kernelsu/kernel/Kconfig ]]; then
-            cp -f drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
+          # Garante include no Kconfig de drivers
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            # insere antes do 'endmenu' final
+            sed -i '/endmenu/i\source "drivers\/kernelsu\/Kconfig"' drivers/Kconfig
           fi
 
-          ln -sfn kernelsu drivers/KernelSU
-
-          sed -i '/obj-y[[:space:]]\+\+=\s*KernelSU\//d' drivers/Makefile || true
-          sed -i '/source\s*"drivers\/KernelSU\/Kconfig"/d' drivers/Kconfig || true
-
-          grep -q 'KernelSU/include' drivers/Makefile 2>/dev/null || \
-            echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
-
-          grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile 2>/dev/null || \
-            echo 'obj-y += kernelsu/' >> drivers/Makefile
-
-          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null; then
-            printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+          # Garante entrada no Makefile de drivers
+          if ! grep -q 'kernelsu/' drivers/Makefile; then
+            echo 'obj-$(CONFIG_KERNELSU) += kernelsu/' >> drivers/Makefile
           fi
 
-          awk '!x[$0]++' drivers/Makefile > .mk && mv .mk drivers/Makefile
-          awk '!x[$0]++' drivers/Kconfig  > .kc && mv .kc drivers/Kconfig
-
-          echo "── Verificando drivers/kernelsu:"
-          ls -la drivers/kernelsu | sed -n '1,120p'
-          test -f drivers/kernelsu/Makefile || { echo "::error::Faltando drivers/kernelsu/Makefile"; exit 2; }
-          test -f drivers/kernelsu/Kconfig  || { echo "::error::Faltando drivers/kernelsu/Kconfig";  exit 2; }
-
-      - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
-        shell: bash
+      # === Limpeza leve do OUT (não apagar árvore fonte) ===
+      - name: Preparar OUT
+        working-directory: ${{ env.KERNEL_DIR }}
         run: |
           set -euxo pipefail
-          cd "$KERNEL_DIR"
-          git ls-files -z \
-            | xargs -0 file --mime-type \
-            | grep 'text/' \
-            | cut -d: -f1 \
-            | xargs -r sed -i 's/\r$//'
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}"
 
-      - name: Hotfix EROFS (unused variable com -Werror)
-        shell: bash
+      # === Defconfig não-interativa (evita "explicit update") ===
+      - name: Gerar .config (não-interativo)
+        working-directory: ${{ env.KERNEL_DIR }}
+        env:
+          LLVM: 1
+          CC: clang
+          HOSTCC: clang
+          ARCH: ${{ env.ARCH }}
+          SUBARCH: ${{ env.SUBARCH }}
         run: |
           set -euxo pipefail
-          cd "$KERNEL_DIR"
-          f="fs/erofs/inode.c"
-          if [[ -f "$f" ]] && grep -qE '^[[:space:]]*loff_t[[:space:]]+off;[[:space:]]*$' "$f"; then
-            sed -i 's/^\([[:space:]]*\)loff_t[[:space:]]\+off;$/\1loff_t __maybe_unused off;/' "$f"
-            echo "→ Hotfix aplicado em $f"
-          fi
 
-      - name: Compilar Kernel (defconfig + build, com log)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$KERNEL_DIR"
-          export ARCH=arm64 SUBARCH=arm64 LC_ALL=C
-          if [[ -n "${CLANG_DIR:-}" && -d "${CLANG_DIR}" ]]; then
-            export PATH="${CLANG_DIR}/bin:${PATH}"
-          fi
-
-          want="${DEFCONFIG_NAME}"
-          base="${want##*/}"
-          path1="arch/arm64/configs/${want}"
-          found=""
-
-          if [[ -f "$path1" ]]; then
-            found="$want"
+          # Se o defconfig indicado não existir, cair para gki_defconfig
+          if ! [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
+            echo "Warning: ${DEFCONFIG} não encontrado; usando gki_defconfig"
+            make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} LLVM=1 CC=clang HOSTCC=clang gki_defconfig
           else
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            if [[ -n "$cand" ]]; then
-              found="${cand#arch/arm64/configs/}"
-            else
-              prefix="${base%_defconfig}"
-              cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
-              [[ -z "$cand" ]] && cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
-              if [[ -n "$cand" ]]; then
-                found="${cand#arch/arm64/configs/}"
-              fi
-            fi
+            make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} LLVM=1 CC=clang HOSTCC=clang "${DEFCONFIG}"
           fi
 
-          if [[ -z "$found" ]]; then
-            echo "::warning::Defconfig '${want}' não encontrado. Listando alguns candidatos:"
-            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -n 200 || true
-            for fb in vendor/gki_defconfig gki_defconfig; do
-              if [[ -f "arch/arm64/configs/$fb" ]]; then found="$fb"; echo "→ Usando fallback: $fb"; break; fi
-            done
-          fi
+          # Força opções necessárias no .config
+          "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --enable  KERNELSU || true
+          "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --disable LTO_CLANG || true
+          "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --disable THINLTO || true
+          "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --enable  LTO_NONE || true
 
-          if [[ -z "$found" ]]; then
-            echo "::error::Nenhum defconfig compatível encontrado (queria '${want}')."
-            exit 2
-          fi
+          # Resolve quaisquer novas opções sem interação
+          yes "" | make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} LLVM=1 CC=clang HOSTCC=clang olddefconfig
 
-          echo "→ Defconfig selecionado: $found"
-          make O=out "$found" V=1 2>&1 | tee build.log
-
-          # Kconfig não-interativo
-          if [[ -x ./scripts/config ]]; then
-            ./scripts/config --file out/.config \
-              -e COMPAT -e KUSER_HELPERS -e COMPAT_VDSO \
-              -d SHADOW_CALL_STACK -e LTO_NONE -d LTO_CLANG \
-              -e RELR -e INIT_STACK_NONE -d INIT_STACK_ALL_PATTERN \
-              -d INIT_STACK_ALL_ZERO -e INIT_ON_ALLOC_DEFAULT_ON \
-              -d INIT_ON_FREE_DEFAULT_ON || true
-          fi
-          make O=out olddefconfig 2>&1 | tee -a build.log
-          # garante timestamp mais novo da .config
-          touch out/.config
-          # NÃO trave o syncconfig (evita "requires explicit update")
-          unset KCONFIG_NOSILENTUPDATE || true
-
-          # build
-          set +e
-          make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 V=1 \
-               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-               KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function" \
-               2>&1 | tee -a build.log
-          MAKE_RC=${PIPESTATUS[0]}
-          set -e
-
-          if [[ $MAKE_RC -ne 0 ]]; then
-            echo "::error::Compilação falhou. Verificando log…"
-            exit $MAKE_RC
-          fi
-
-          ls -la out/arch/arm64/boot || true
-
-      - name: Diagnóstico de falha (se houver)
-        if: failure()
-        shell: bash
+      # === Build (Image + dtbs) ===
+      - name: Compilar Kernel (olddefconfig + build, com log)
+        working-directory: ${{ env.KERNEL_DIR }}
+        env:
+          LLVM: 1
+          CC: clang
+          HOSTCC: clang
+          ARCH: ${{ env.ARCH }}
+          SUBARCH: ${{ env.SUBARCH }}
         run: |
           set -euxo pipefail
-          cd "$KERNEL_DIR"
-          echo "=== HEAD do log (200 linhas) ==="
-          head -n 200 build.log || true
-          echo "=== TAIL do log (200 linhas) ==="
-          tail -n 200 build.log || true
-          echo "=== Erros encontrados (contexto ±3) ==="
-          grep -nEi -C3 '(^|\s)(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
-          echo "=== .config (parcial) ==="
-          test -f out/.config && sed -n '1,160p' out/.config || true
+          # flags padrões para evitar warnings fatais com clang
+          export KCFLAGS="-Wno-error"
+          make -j"$(nproc)" O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} \
+               LLVM=1 CC=clang HOSTCC=clang \
+               Image.gz-dtb
 
-      - name: Upload de logs e .config
-        if: always()
+      # === Empacotar com AnyKernel3 (se você já tem este diretório no repo) ===
+      - name: Empacotar com AnyKernel3
+        if: ${{ always() }}
+        run: |
+          set -euxo pipefail
+          if [ -d "${ANYKERNEL_DIR}" ] && [ -f "${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp -f "${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz-dtb" "${ANYKERNEL_DIR}/Image.gz-dtb"
+            cd "${ANYKERNEL_DIR}"
+            zip -r9 ../debug-kernel-ksu.zip ./*
+          else
+            echo "AnyKernel3 ausente ou Image.gz-dtb não gerada; pulando empacote."
+          fi
+
+      - name: Publicar artefato
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: debug-kernel-logs
           path: |
-            ${{ env.KERNEL_DIR }}/build.log
-            ${{ env.KERNEL_DIR }}/out/.config
-
-      - name: Empacotar com AnyKernel3
-        if: success()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE"
-          rm -rf AnyKernel3
-          git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
-          KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
-          if [[ ! -f "$KIMG" ]]; then
-            echo "::error::Kernel Image não encontrado em $KIMG"
-            ls -la "$KERNEL_DIR/out/arch/arm64/boot" || true
-            exit 2
-          fi
-          cp -fv "$KIMG" AnyKernel3/
-          cd AnyKernel3
-          zip -r9 "../kernel-${ROM_TEXT:-build}.zip" . -x "*.git*"
-          echo "ZIP_PATH=$GITHUB_WORKSPACE/kernel-${ROM_TEXT:-build}.zip" >> "$GITHUB_ENV"
-
-      - name: Publicar artefato
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-${{ env.ROM_TEXT || 'build' }}
-          path: ${{ env.ZIP_PATH }}
+            ${{ env.KERNEL_DIR }}/out/build.log
+            debug-kernel-ksu.zip
+          if-no-files-found: warn
