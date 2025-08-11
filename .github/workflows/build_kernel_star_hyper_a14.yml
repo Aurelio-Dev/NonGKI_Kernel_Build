@@ -34,75 +34,34 @@ jobs:
           python3 --version || true
           git --version
 
-      # ======================================================
-      # CARREGAR PERFIL — somente chaves whitelisted (robusto)
-      # ======================================================
       - name: Carregar perfil
         id: load_env
-        shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          test -f "Profiles/${PROFILE_NAME}"
+          echo "→ Perfil: Profiles/${PROFILE_NAME}"
 
-          PROFILE="Profiles/${PROFILE_NAME}"
-          test -f "${PROFILE}" || { echo "::error::Perfil não encontrado: ${PROFILE}"; exit 2; }
-          echo "→ Perfil: ${PROFILE}"
-
-          # 1) Sanitiza: remove CRLF, espaços ao redor, ignora comentários/linhas vazias
-          SANITIZED="$(mktemp)"
-          sed -E 's/\r$//; s/^[[:space:]]+//; s/[[:space:]]+$//;' "${PROFILE}" \
-          | grep -E '^[A-Za-z_][A-Za-z0-9_]*=.*' \
-          > "${SANITIZED}"
-
-          echo "→ Pré-sanitizado:"
-          nl -ba "${SANITIZED}"
-
-          # 2) Whitelist de chaves permitidas (bloqueia lixo como VARS=(, PROFILE=, etc.)
-          ALLOW='^(KERNEL_SOURCE|KERNEL_BRANCH|DEFCONFIG_NAME|CLANG_SOURCE|CLANG_TRIPLE|EXTRA_CMDS|AK3_SOURCE|AK3_BRANCH|KERNELSU_SOURCE|KERNELSU_BRANCH|KERNELSU_NAME|ROM_TEXT|SUSFS_ENABLE|SUSFS_FIXED|SUSFS_UPDATE|BOOT_SOURCE|LXC_ENABLE|HAVE_NO_DTBO|HAVE_NO_DTBO_TOOL)='
-          FILTERED="$(mktemp)"
-          grep -E "${ALLOW}" "${SANITIZED}" > "${FILTERED}" || true
-
-          # 3) Checa linhas suspeitas
-          if grep -Eq '[(){};|`]' "${FILTERED}"; then
-            echo "::error::Seu .env contém caracteres de shell inválidos. Deixe APENAS pares CHAVE=VALOR. Linhas suspeitas:"
-            grep -nE '[(){};|`]' "${FILTERED}" || true
-            exit 2
-          fi
-
-          echo "→ Conteúdo final (filtrado):"
-          nl -ba "${FILTERED}"
-
-          # 4) Exporta variáveis do .env filtrado
-          set -a
-          # shellcheck disable=SC1090
-          . "${FILTERED}"
-          set +a
-
-          # 5) Copia variáveis úteis para o ambiente do job
-          VARS=(
-            KERNEL_SOURCE KERNEL_BRANCH DEFCONFIG_NAME
-            CLANG_SOURCE CLANG_TRIPLE EXTRA_CMDS
-            AK3_SOURCE AK3_BRANCH
-            KERNELSU_SOURCE KERNELSU_BRANCH KERNELSU_NAME
-            ROM_TEXT SUSFS_ENABLE SUSFS_FIXED SUSFS_UPDATE
-            BOOT_SOURCE LXC_ENABLE HAVE_NO_DTBO HAVE_NO_DTBO_TOOL
-          )
-          for v in "${VARS[@]}"; do
-            if [[ -n "${!v-}" ]]; then
-              printf '%s=%s\n' "$v" "${!v}" >> "$GITHUB_ENV"
+          # Exporta somente linhas KEY=VALUE (sem espaços ao redor do '=').
+          while IFS= read -r raw || [ -n "$raw" ]; do
+            # ignora vazio e comentários
+            [ -z "$raw" ] && continue
+            case "$raw" in \#*) continue;; esac
+            # só aceita KEY=VALUE sem espaços ao redor do '='
+            if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
+              k="${raw%%=*}"
+              v="${raw#*=}"
+              # tira aspas de envoltória se houver
+              v="${v%\"}"; v="${v#\"}"
+              v="${v%\'}"; v="${v#\'}"
+              echo "$k=$v" >> "$GITHUB_ENV"
+              printf '  %s=%s\n' "$k" "$v"
             fi
-          done
+          done < "Profiles/${PROFILE_NAME}"
 
-          echo "→ Variáveis essenciais:"
-          for v in KERNEL_SOURCE KERNEL_BRANCH DEFCONFIG_NAME ROM_TEXT; do
-            printf '   %s=%s\n' "$v" "${!v-}"
-          done
+          # Guard-rails mínimos (o clone robusto abaixo tolera branch ausente).
+          test -n "${KERNEL_SOURCE:-}" || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
+          test -n "${DEFCONFIG_NAME:-}" || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
 
-          # 6) Guard-rails mínimos
-          : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
-          : "${KERNEL_BRANCH:?KERNEL_BRANCH não definido no perfil}"
-          : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
-
-      # ============ LLVM opcional ============
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
         run: |
@@ -115,7 +74,6 @@ jobs:
           echo "LLVM_IAS=1"    >> $GITHUB_ENV
           echo "LD=ld.lld"     >> $GITHUB_ENV
 
-      # ============ Toolchain fallback ============
       - name: Instalar toolchain fallback (se não baixou clang)
         if: ${{ env.CLANG_SOURCE == '' }}
         run: |
@@ -127,61 +85,103 @@ jobs:
           echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
           echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
 
-      # ============ Kernel source ============
-      - name: Clonar fonte do Kernel
+      - name: Clonar fonte do Kernel (robusto a branch ausente)
         run: |
           set -euxo pipefail
           rm -rf device_kernel
-          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
-          cd device_kernel
-          echo "KERNEL_TREE=$(pwd)" >> $GITHUB_ENV
 
-      # ============ Injetar KernelSU ============
+          SRC="${KERNEL_SOURCE}"
+          # KERNEL_REF tem prioridade; se vazio, usa KERNEL_BRANCH; se não existir, cai no default branch
+          REF="${KERNEL_REF:-${KERNEL_BRANCH:-}}"
+
+          find_ref() {
+            # retorna 0 se a ref existe como head ou tag
+            if git ls-remote --heads "$SRC" "$1" | grep -q .; then
+              echo "::notice::Encontrado branch '$1' no remoto."
+              return 0
+            fi
+            if git ls-remote --tags "$SRC" "$1" | grep -q .; then
+              echo "::notice::Encontrado tag '$1' no remoto."
+              return 0
+            fi
+            return 1
+          }
+
+          if [ -n "$REF" ]; then
+            if find_ref "$REF"; then
+              git clone --depth=1 -b "$REF" "$SRC" device_kernel
+              echo "KERNEL_TREE=$(pwd)/device_kernel" >> $GITHUB_ENV
+              exit 0
+            fi
+            # Pode ser commit/ref arbitrária: clona padrão e dá fetch/checkout da ref
+            if git ls-remote "$SRC" | grep -qi "$REF"; then
+              git clone --depth=1 "$SRC" device_kernel
+              cd device_kernel
+              git fetch --depth=1 origin "$REF"
+              git checkout --detach FETCH_HEAD
+              cd ..
+              echo "::notice::Usando ref arbitrária '$REF' (commit/ref)."
+              echo "KERNEL_TREE=$(pwd)/device_kernel" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "::warning::Referência '$REF' não encontrada; usando branch padrão do repositório."
+          fi
+
+          # Descobre o branch padrão do repo
+          DEFAULT_BRANCH="$(git ls-remote --symref "$SRC" HEAD | awk '/^ref:/{print $2}' | sed 's#refs/heads/##')"
+          echo "::notice::Branch padrão do repositório: ${DEFAULT_BRANCH}"
+          git clone --depth=1 -b "$DEFAULT_BRANCH" "$SRC" device_kernel
+
+          echo "KERNEL_TREE=$(pwd)/device_kernel" >> $GITHUB_ENV
+
+      # ---------------------------------------------------------
+      # KernelSU — injeta de forma idempotente
+      # ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
 
           KS_DIR="drivers/kernelsu"
-          rm -rf "$KS_DIR" && mkdir -p "$KS_DIR"
-
-          : "${KERNELSU_SOURCE:=https://github.com/tiann/KernelSU.git}"
-          : "${KERNELSU_BRANCH:=main}"
+          # limpa qualquer arquivo/dir existente
+          rm -rf "$KS_DIR"
+          mkdir -p "$KS_DIR"
 
           git clone --depth=1 -b "${KERNELSU_BRANCH}" "${KERNELSU_SOURCE}" /tmp/KernelSU
-          cp -a /tmp/KernelSU/kernel/* "$KS_DIR"/
+          cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
 
+          # inclui no Kconfig/Makefile principais (evita duplicação)
           grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
             echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
+
           grep -q 'obj-$(CONFIG_KSU)      += kernelsu/' drivers/Makefile || \
             echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
 
-      # ============ Sanear textos ============
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
-          find . -type f \( -name "Makefile" -o -name "Kconfig" -o -name "*.mk" -o -name "*.cfg" \) \
-            -print0 | xargs -0 sed -i 's/\r$//'
+          find . -type f \( -name "Makefile" -o -name "Kconfig" -o -name "*.mk" -o -name "*.cfg" \) -print0 \
+            | xargs -0 sed -i 's/\r$//'
 
-      # ============ Hotfix binder_gki.c ============
+      # Hotfix opcional: binder_gki.c (millet) – troca include angulado por include com aspas
       - name: Hotfix:binder_gki.c include path (millet)
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
           FILE="drivers/mihw/millet/binder_gki.c"
-          if [[ -f "$FILE" ]]; then
-            sed -i 's|^#include <\.\./\.\./android/binder_internal\.h>|#include "android/binder_internal.h"|' "$FILE" || true
-            sed -i 's|^#include <android/binder_internal\.h>|#include "android/binder_internal.h"|' "$FILE" || true
+          if [ -f "$FILE" ]; then
+            echo "::notice::Aplicando hotfix no $FILE"
+            sed -i 's|#include <\(\.\./\.\./android/binder_internal\.h\)>|#include "\1"|' "$FILE" || true
+            sed -i 's|#include <android/binder_internal\.h>|#include "android/binder_internal.h"|' "$FILE" || true
           fi
 
-      # ============ Build ============
       - name: Compilar Kernel (defconfig + build)
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
-          echo "Usando defconfig: ${DEFCONFIG_NAME}"
 
+          echo "Usando defconfig: ${DEFCONFIG_NAME}"
           export ARCH=arm64
           export SUBARCH=arm64
 
@@ -192,8 +192,7 @@ jobs:
             ${LLVM_IAS:+LLVM_IAS=1} \
             ${LD:+LD=$LD} \
             ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
-            ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32} \
-            ${EXTRA_CMDS:+$EXTRA_CMDS}
+            ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
 
           mkdir -p "$GITHUB_WORKSPACE/out"
           for f in \
@@ -203,18 +202,15 @@ jobs:
             out/arch/arm64/boot/Image.gz-dtb \
             out/arch/arm64/boot/Image.gz \
             out/arch/arm64/boot/Image; do
-            [[ -f "$f" ]] && cp -av "$f" "$GITHUB_WORKSPACE/out/" || true
+            [ -f "$f" ] && cp -av "$f" "$GITHUB_WORKSPACE/out/" || true
           done
 
-      # ============ AnyKernel3 ============
       - name: Empacotar com AnyKernel3
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE"
           rm -rf AnyKernel3
-          : "${AK3_SOURCE:=https://github.com/osm0sis/AnyKernel3.git}"
-          : "${AK3_BRANCH:=master}"
-          git clone --depth=1 -b "${AK3_BRANCH}" "${AK3_SOURCE}" AnyKernel3
+          git clone --depth=1 "${AK3_SOURCE}" -b "${AK3_BRANCH}" AnyKernel3
           cp -av out/* AnyKernel3/ || true
           cd AnyKernel3
           zip -r9 "$GITHUB_WORKSPACE/Kernel-star_hyper_a14-$(date +%Y%m%d-%H%M).zip" ./
