@@ -89,20 +89,30 @@ jobs:
           fi
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: "Injetar KernelSU (em drivers/KernelSU)"
+      - name: "Injetar KernelSU (normaliza layout em drivers/KernelSU)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          # Limpa tentativas anteriores (raiz ou drivers/kernelsu)
-          rm -rf KernelSU drivers/KernelSU drivers/kernelsu || true
+          # Limpa tentativas anteriores
+          rm -rf KernelSU drivers/KernelSU drivers/kernelsu ksu_tmp || true
           mkdir -p drivers
 
-          # Clona KernelSU na pasta que o Kbuild está buscando
-          git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" drivers/KernelSU
+          # Clona em tmp e descobre onde está a pasta 'KernelSU' de verdade
+          git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" ksu_tmp
 
-          # Alguns branches têm Kconfig em kernel/Kconfig – cria o alias no topo
+          # Se o repo tiver uma pasta 'KernelSU' interna, usamos ela; senão usamos a raiz
+          SRC_DIR="ksu_tmp"
+          if [[ -d ksu_tmp/KernelSU && -f ksu_tmp/KernelSU/Makefile ]]; then
+            SRC_DIR="ksu_tmp/KernelSU"
+          fi
+
+          # Copia o conteúdo nivelado para drivers/KernelSU
+          mkdir -p drivers/KernelSU
+          cp -a "${SRC_DIR}/." drivers/KernelSU/
+
+          # Alguns branches têm Kconfig em kernel/Kconfig – cria alias no topo
           if [[ ! -f drivers/KernelSU/Kconfig && -f drivers/KernelSU/kernel/Kconfig ]]; then
             cp -f drivers/KernelSU/kernel/Kconfig drivers/KernelSU/Kconfig
           fi
@@ -110,6 +120,7 @@ jobs:
           # Garante include e linkagem no drivers/Makefile
           grep -q "subdir-ccflags-y.*drivers/KernelSU/include" drivers/Makefile || \
             echo 'subdir-ccflags-y += -I$(srctree)/drivers/KernelSU/include' >> drivers/Makefile
+
           grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile || \
             echo 'obj-y += KernelSU/' >> drivers/Makefile
 
@@ -118,8 +129,10 @@ jobs:
           grep -q 'drivers/KernelSU/Kconfig' drivers/Kconfig || \
             printf '\nsource "drivers/KernelSU/Kconfig"\n' >> drivers/Kconfig
 
-          echo "── Conteúdo de drivers/KernelSU:"
+          echo "── Conteúdo de drivers/KernelSU (topo):"
           ls -la drivers/KernelSU | sed -n '1,80p'
+          test -f drivers/KernelSU/Makefile && echo "OK: drivers/KernelSU/Makefile existe"
+          test -f drivers/KernelSU/Kconfig   && echo "OK: drivers/KernelSU/Kconfig existe"
 
 
       - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
