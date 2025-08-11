@@ -23,7 +23,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p Profiles
           PROFILE_PATH="Profiles/${{ github.event.inputs.PROFILE_NAME }}"
           if [[ ! -f "${PROFILE_PATH}" ]]; then
@@ -31,16 +30,13 @@ jobs:
             ls -la Profiles || true
             exit 2
           fi
-
           echo "→ Usando perfil: ${PROFILE_PATH}"
           sed -i 's/\r$//' "${PROFILE_PATH}"
-
           while IFS= read -r raw || [[ -n "$raw" ]]; do
             [[ -z "$raw" ]] && continue
             [[ "$raw" =~ ^[[:space:]]*# ]] && continue
             if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
-              k="${raw%%=*}"
-              v="${raw#*=}"
+              k="${raw%%=*}"; v="${raw#*=}"
               v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
               k="${k%$'\r'}"; v="${v%$'\r'}"
               export "$k=$v"
@@ -48,7 +44,6 @@ jobs:
               printf '  %s=%s\n' "$k" "$v"
             fi
           done < "${PROFILE_PATH}"
-
           [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
           [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
 
@@ -82,7 +77,6 @@ jobs:
           set -euxo pipefail
           git --version
           rm -rf kernel-src || true
-
           if [[ -n "${KERNEL_REF:-}" ]]; then
             git clone --depth 1 --branch "$KERNEL_REF" "$KERNEL_SOURCE" kernel-src
           else
@@ -93,7 +87,6 @@ jobs:
               git clone --depth 1 --branch "$default_branch" "$KERNEL_SOURCE" kernel-src
             fi
           fi
-
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
       - name: "Injetar KernelSU (robusto; garante KernelSU/Kconfig)"
@@ -101,8 +94,6 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-
-          # Se existir e estiver vazio/submódulo, recria
           need_clone=0
           if [[ -d KernelSU ]]; then
             if [[ ! -d KernelSU/.git ]] || { [[ ! -f KernelSU/Kconfig ]] && [[ ! -f KernelSU/kernel/Kconfig ]] ; }; then
@@ -113,22 +104,17 @@ jobs:
           else
             need_clone=1
           fi
-
           if [[ "$need_clone" -eq 1 ]]; then
             git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
           else
             echo "KernelSU já presente e utilizável."
           fi
-
-          # Include e linkagem no Makefile
           if ! grep -q "subdir-ccflags-y.*KernelSU/include" drivers/Makefile 2>/dev/null || true; then
             echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
           fi
           if ! grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile 2>/dev/null || true; then
             echo 'obj-y += KernelSU/' >> drivers/Makefile
           fi
-
-          # Garante KernelSU/Kconfig (copia se só existir em KernelSU/kernel/Kconfig)
           if [[ ! -f KernelSU/Kconfig ]]; then
             if [[ -f KernelSU/kernel/Kconfig ]]; then
               cp -f KernelSU/kernel/Kconfig KernelSU/Kconfig
@@ -139,13 +125,10 @@ jobs:
               exit 2
             fi
           fi
-
-          # drivers/Kconfig deve referenciar KernelSU/Kconfig
           sed -i 's#drivers/kernelsu/Kconfig#KernelSU/Kconfig#g; s#KernelSU/kernel/Kconfig#KernelSU/Kconfig#g' drivers/Kconfig || true
           if ! grep -q 'KernelSU/Kconfig' drivers/Kconfig 2>/dev/null; then
             printf '\nsource "KernelSU/Kconfig"\n' >> drivers/Kconfig
           fi
-
           echo "── Conteúdo de KernelSU/:"
           ls -la KernelSU || true
 
@@ -160,32 +143,28 @@ jobs:
             | cut -d: -f1 \
             | xargs -r sed -i 's/\r$//'
 
-      - name: "Compilar Kernel (defconfig + build)"
+      - name: "Compilar Kernel (defconfig + build, com log)"
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           cd "$KERNEL_DIR"
-
           export ARCH=arm64 SUBARCH=arm64 LC_ALL=C
           if [[ -n "${CLANG_DIR:-}" && -d "${CLANG_DIR}" ]]; then
             export PATH="${CLANG_DIR}/bin:${PATH}"
           fi
 
-          # === Detecta defconfig automaticamente ===
           want="${DEFCONFIG_NAME}"
-          base="${want##*/}"                         # ex.: star_hyper_a14_defconfig
+          base="${want##*/}"
           path1="arch/arm64/configs/${want}"
           found=""
 
           if [[ -f "$path1" ]]; then
             found="$want"
           else
-            # tenta procurar pelo mesmo nome em qualquer subpasta
             cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
             if [[ -n "$cand" ]]; then
               found="${cand#arch/arm64/configs/}"
             else
-              # tenta variantes: sem vendor/, prefixo, etc.
               prefix="${base%_defconfig}"
               cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
               [[ -z "$cand" ]] && cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
@@ -198,7 +177,6 @@ jobs:
           if [[ -z "$found" ]]; then
             echo "::warning::Defconfig '${want}' não encontrado. Listando alguns candidatos:"
             find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -n 200 || true
-            # fallbacks comuns
             for fb in vendor/gki_defconfig gki_defconfig; do
               if [[ -f "arch/arm64/configs/$fb" ]]; then found="$fb"; echo "→ Usando fallback: $fb"; break; fi
             done
@@ -210,22 +188,55 @@ jobs:
           fi
 
           echo "→ Defconfig selecionado: $found"
-          make O=out "$found"
+          make O=out "$found" V=1 2>&1 | tee build.log
 
-          # === Build ===
-          make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 \
-               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+          # Build principal com log completo
+          set +e
+          make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 V=1 \
+               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               2>&1 | tee -a build.log
+          MAKE_RC=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $MAKE_RC -ne 0 ]]; then
+            echo "::error::Compilação falhou. Verificando log…"
+            exit $MAKE_RC
+          fi
 
           ls -la out/arch/arm64/boot || true
 
+      - name: "Diagnóstico de falha (se houver)"
+        if: failure()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          echo "=== HEAD do log (200 linhas) ==="
+          head -n 200 build.log || true
+          echo "=== TAIL do log (200 linhas) ==="
+          tail -n 200 build.log || true
+          echo "=== Erros encontrados (contexto ±3 linhas) ==="
+          grep -nEi -C3 '(^|\s)(error:|fatal error:|undefined reference|No rule to make target)' build.log || true
+          echo "=== Defconfig efetivo e .config ==="
+          test -f out/.config && sed -n '1,120p' out/.config || true
+
+      - name: "Upload de logs e .config"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-kernel-logs
+          path: |
+            ${{ env.KERNEL_DIR }}/build.log
+            ${{ env.KERNEL_DIR }}/out/.config
+
       - name: "Empacotar com AnyKernel3"
+        if: success()
         shell: bash
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE"
           rm -rf AnyKernel3
           git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
-
           KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
           if [[ ! -f "$KIMG" ]]; then
             echo "::error::Kernel Image não encontrado em $KIMG"
@@ -238,6 +249,7 @@ jobs:
           echo "ZIP_PATH=$GITHUB_WORKSPACE/kernel-${ROM_TEXT:-build}.zip" >> "$GITHUB_ENV"
 
       - name: "Publicar artefato"
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: kernel-${{ env.ROM_TEXT || 'build' }}
