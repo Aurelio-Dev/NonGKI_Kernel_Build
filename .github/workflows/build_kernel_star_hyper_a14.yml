@@ -26,7 +26,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Mostrar versões do runner
-        shell: bash
         run: |
           set -euxo pipefail
           uname -a
@@ -35,7 +34,9 @@ jobs:
           python3 --version || true
           git --version
 
-      # ============ CARREGAR PERFIL (correto/robusto) ============
+      # ======================================================
+      # CARREGAR PERFIL — somente chaves whitelisted (robusto)
+      # ======================================================
       - name: Carregar perfil
         id: load_env
         shell: bash
@@ -43,28 +44,40 @@ jobs:
           set -euo pipefail
 
           PROFILE="Profiles/${PROFILE_NAME}"
-          [[ -f "$PROFILE" ]] || { echo "::error::Perfil não encontrado: ${PROFILE}"; exit 2; }
+          test -f "${PROFILE}" || { echo "::error::Perfil não encontrado: ${PROFILE}"; exit 2; }
           echo "→ Perfil: ${PROFILE}"
 
-          # 1) Sanitiza: CRLF→LF, remove comentários/linhas vazias/ espaços excedentes,
-          #    mantém apenas linhas CHAVE=VALOR (CHAVE compatível com bash)
+          # 1) Sanitiza: remove CRLF, espaços ao redor, ignora comentários/linhas vazias
           SANITIZED="$(mktemp)"
-          sed -E 's/\r$//' "$PROFILE" \
-            | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-            | grep -Ev '^(#|$)' \
-            | grep -E '^[A-Za-z_][A-Za-z0-9_]*=.*' \
-            > "$SANITIZED"
+          sed -E 's/\r$//; s/^[[:space:]]+//; s/[[:space:]]+$//;' "${PROFILE}" \
+          | grep -E '^[A-Za-z_][A-Za-z0-9_]*=.*' \
+          > "${SANITIZED}"
 
-          echo "→ Conteúdo sanitizado:"
-          nl -ba "$SANITIZED"
+          echo "→ Pré-sanitizado:"
+          nl -ba "${SANITIZED}"
 
-          # 2) Carrega e exporta as variáveis do perfil para este shell
+          # 2) Whitelist de chaves permitidas (bloqueia lixo como VARS=(, PROFILE=, etc.)
+          ALLOW='^(KERNEL_SOURCE|KERNEL_BRANCH|DEFCONFIG_NAME|CLANG_SOURCE|CLANG_TRIPLE|EXTRA_CMDS|AK3_SOURCE|AK3_BRANCH|KERNELSU_SOURCE|KERNELSU_BRANCH|KERNELSU_NAME|ROM_TEXT|SUSFS_ENABLE|SUSFS_FIXED|SUSFS_UPDATE|BOOT_SOURCE|LXC_ENABLE|HAVE_NO_DTBO|HAVE_NO_DTBO_TOOL)='
+          FILTERED="$(mktemp)"
+          grep -E "${ALLOW}" "${SANITIZED}" > "${FILTERED}" || true
+
+          # 3) Checa linhas suspeitas
+          if grep -Eq '[(){};|`]' "${FILTERED}"; then
+            echo "::error::Seu .env contém caracteres de shell inválidos. Deixe APENAS pares CHAVE=VALOR. Linhas suspeitas:"
+            grep -nE '[(){};|`]' "${FILTERED}" || true
+            exit 2
+          fi
+
+          echo "→ Conteúdo final (filtrado):"
+          nl -ba "${FILTERED}"
+
+          # 4) Exporta variáveis do .env filtrado
           set -a
           # shellcheck disable=SC1090
-          . "$SANITIZED"
+          . "${FILTERED}"
           set +a
 
-          # 3) Propaga ao ambiente dos próximos steps
+          # 5) Copia variáveis úteis para o ambiente do job
           VARS=(
             KERNEL_SOURCE KERNEL_BRANCH DEFCONFIG_NAME
             CLANG_SOURCE CLANG_TRIPLE EXTRA_CMDS
@@ -79,12 +92,12 @@ jobs:
             fi
           done
 
-          echo "→ Variáveis chave:"
+          echo "→ Variáveis essenciais:"
           for v in KERNEL_SOURCE KERNEL_BRANCH DEFCONFIG_NAME ROM_TEXT; do
             printf '   %s=%s\n' "$v" "${!v-}"
           done
 
-          # 4) Guard-rails
+          # 6) Guard-rails mínimos
           : "${KERNEL_SOURCE:?KERNEL_SOURCE não definido no perfil}"
           : "${KERNEL_BRANCH:?KERNEL_BRANCH não definido no perfil}"
           : "${DEFCONFIG_NAME:?DEFCONFIG_NAME não definido no perfil}"
@@ -92,55 +105,49 @@ jobs:
       # ============ LLVM opcional ============
       - name: (Opcional) Baixar LLVM/Clang do perfil
         if: ${{ env.CLANG_SOURCE != '' }}
-        shell: bash
         run: |
           set -euxo pipefail
           mkdir -p "$GITHUB_WORKSPACE/clang"
           curl -L --retry 3 --retry-delay 3 "$CLANG_SOURCE" -o /tmp/clang.tar.xz
           tar -xJf /tmp/clang.tar.xz -C "$GITHUB_WORKSPACE/clang" --strip-components=1
-          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
-          echo "LLVM=1"     >> "$GITHUB_ENV"
-          echo "LLVM_IAS=1" >> "$GITHUB_ENV"
-          echo "LD=ld.lld"  >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
+          echo "LLVM=1"        >> $GITHUB_ENV
+          echo "LLVM_IAS=1"    >> $GITHUB_ENV
+          echo "LD=ld.lld"     >> $GITHUB_ENV
 
       # ============ Toolchain fallback ============
       - name: Instalar toolchain fallback (se não baixou clang)
         if: ${{ env.CLANG_SOURCE == '' }}
-        shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev \
               libelf-dev ccache python3 python2 curl git rsync lz4 \
               gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
-          echo "CROSS_COMPILE=aarch64-linux-gnu-"      >> "$GITHUB_ENV"
-          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
 
       # ============ Kernel source ============
       - name: Clonar fonte do Kernel
-        shell: bash
         run: |
           set -euxo pipefail
           rm -rf device_kernel
           git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
           cd device_kernel
-          echo "KERNEL_TREE=$(pwd)" >> "$GITHUB_ENV"
+          echo "KERNEL_TREE=$(pwd)" >> $GITHUB_ENV
 
       # ============ Injetar KernelSU ============
       - name: Injetar KernelSU no tree do kernel
-        shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
 
           KS_DIR="drivers/kernelsu"
-          rm -rf "$KS_DIR"
-          mkdir -p "$KS_DIR"
+          rm -rf "$KS_DIR" && mkdir -p "$KS_DIR"
 
-          : "${KERNELSU_SOURCE:?KERNELSU_SOURCE não definido}"
-          : "${KERNELSU_BRANCH:?KERNELSU_BRANCH não definido}"
+          : "${KERNELSU_SOURCE:=https://github.com/tiann/KernelSU.git}"
+          : "${KERNELSU_BRANCH:=main}"
 
-          rm -rf /tmp/KernelSU
           git clone --depth=1 -b "${KERNELSU_BRANCH}" "${KERNELSU_SOURCE}" /tmp/KernelSU
           cp -a /tmp/KernelSU/kernel/* "$KS_DIR"/
 
@@ -151,7 +158,6 @@ jobs:
 
       # ============ Sanear textos ============
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
-        shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
@@ -160,7 +166,6 @@ jobs:
 
       # ============ Hotfix binder_gki.c ============
       - name: Hotfix:binder_gki.c include path (millet)
-        shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
@@ -170,13 +175,12 @@ jobs:
             sed -i 's|^#include <android/binder_internal\.h>|#include "android/binder_internal.h"|' "$FILE" || true
           fi
 
-      # ============ Compilar ============
+      # ============ Build ============
       - name: Compilar Kernel (defconfig + build)
-        shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_TREE"
-          echo "→ Defconfig: ${DEFCONFIG_NAME}"
+          echo "Usando defconfig: ${DEFCONFIG_NAME}"
 
           export ARCH=arm64
           export SUBARCH=arm64
@@ -204,19 +208,17 @@ jobs:
 
       # ============ AnyKernel3 ============
       - name: Empacotar com AnyKernel3
-        shell: bash
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE"
+          rm -rf AnyKernel3
           : "${AK3_SOURCE:=https://github.com/osm0sis/AnyKernel3.git}"
           : "${AK3_BRANCH:=master}"
-          rm -rf AnyKernel3
           git clone --depth=1 -b "${AK3_BRANCH}" "${AK3_SOURCE}" AnyKernel3
           cp -av out/* AnyKernel3/ || true
           cd AnyKernel3
           zip -r9 "$GITHUB_WORKSPACE/Kernel-star_hyper_a14-$(date +%Y%m%d-%H%M).zip" ./
 
-      # ============ Artefato ============
       - name: Publicar artefato
         uses: actions/upload-artifact@v4
         with:
