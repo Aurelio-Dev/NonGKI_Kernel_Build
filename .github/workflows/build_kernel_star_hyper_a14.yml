@@ -18,6 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Lê o perfil, normaliza CRLF, EXPORTA no ambiente ATUAL e persiste no GITHUB_ENV
       - name: "Carregar perfil"
         id: load_env
         shell: bash
@@ -25,33 +26,48 @@ jobs:
           set -euo pipefail
 
           mkdir -p Profiles
-          if [[ ! -f "Profiles/${{ github.event.inputs.PROFILE_NAME }}" ]]; then
-            echo "::error::Arquivo de perfil não encontrado: Profiles/${{ github.event.inputs.PROFILE_NAME }}"
+          PROFILE_PATH="Profiles/${{ github.event.inputs.PROFILE_NAME }}"
+          if [[ ! -f "${PROFILE_PATH}" ]]; then
+            echo "::error::Arquivo de perfil não encontrado: ${PROFILE_PATH}"
             echo "Arquivos disponíveis em Profiles/:"
             ls -la Profiles || true
             exit 2
           fi
 
-          echo "→ Usando perfil: Profiles/${{ github.event.inputs.PROFILE_NAME }}"
+          echo "→ Usando perfil: ${PROFILE_PATH}"
           # Normaliza CRLF -> LF
-          sed -i 's/\r$//' "Profiles/${{ github.event.inputs.PROFILE_NAME }}"
+          sed -i 's/\r$//' "${PROFILE_PATH}"
 
-          # Exporta KEY=VALUE válidos para GITHUB_ENV
+          # Exporta KEY=VALUE válidos (agora e para os próximos steps)
           while IFS= read -r raw || [[ -n "$raw" ]]; do
             [[ -z "$raw" ]] && continue
             [[ "$raw" =~ ^[[:space:]]*# ]] && continue
             if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
               k="${raw%%=*}"
               v="${raw#*=}"
+              # remove aspas de envoltória, se houver
               v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+              # remove \r restantes
               k="${k%$'\r'}"; v="${v%$'\r'}"
+
+              # Disponível AGORA neste step:
+              export "$k=$v"
+              # Disponível nos PRÓXIMOS steps:
               echo "$k=$v" >> "$GITHUB_ENV"
+
               printf '  %s=%s\n' "$k" "$v"
             fi
-          done < "Profiles/${{ github.event.inputs.PROFILE_NAME }}"
+          done < "${PROFILE_PATH}"
 
-          : "${KERNEL_SOURCE:?::error::KERNEL_SOURCE não definido no perfil}"
-          : "${DEFCONFIG_NAME:?::error::DEFCONFIG_NAME não definido no perfil}"
+          # Guard-rails neste MESMO step (agora funciona)
+          if [[ -z "${KERNEL_SOURCE:-}" ]]; then
+            echo "::error::KERNEL_SOURCE não definido no perfil"
+            exit 2
+          fi
+          if [[ -z "${DEFCONFIG_NAME:-}" ]]; then
+            echo "::error::DEFCONFIG_NAME não definido no perfil"
+            exit 2
+          fi
 
       - name: "(Opcional) Baixar LLVM/Clang do perfil"
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -159,6 +175,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           rm -rf AnyKernel3
           git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
+
           KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
           if [[ ! -f "$KIMG" ]]; then
             echo "::error::Kernel Image não encontrado em $KIMG"
