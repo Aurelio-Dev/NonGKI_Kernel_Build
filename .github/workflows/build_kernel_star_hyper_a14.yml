@@ -153,7 +153,7 @@ jobs:
           cd "$KERNEL_DIR"
           f="fs/erofs/inode.c"
           if [[ -f "$f" ]] && grep -qE '^[[:space:]]*loff_t[[:space:]]+off;[[:space:]]*$' "$f"; then
-            sed -i 's/^\([[:space:]]*\)loff_t[[:space:]]\+off;$/\1__maybe_unused loff_t off;/' "$f"
+            sed -i 's/^\([[:space:]]*\)loff_t[[:space:]]\+off;$/\1loff_t __maybe_unused off;/' "$f"
             echo "→ Hotfix aplicado em $f"
           fi
 
@@ -204,25 +204,19 @@ jobs:
           echo "→ Defconfig selecionado: $found"
           make O=out "$found" V=1 2>&1 | tee build.log
 
-          # === Anti-interativo: responda Kconfig e congele a .config ===
+          # Kconfig não-interativo
           if [[ -x ./scripts/config ]]; then
             ./scripts/config --file out/.config \
-              -e COMPAT \
-              -e KUSER_HELPERS \
-              -e COMPAT_VDSO \
-              -d SHADOW_CALL_STACK \
-              -e LTO_NONE \
-              -d LTO_CLANG \
-              -e RELR \
-              -e INIT_STACK_NONE \
-              -d INIT_STACK_ALL_PATTERN \
-              -d INIT_STACK_ALL_ZERO \
-              -e INIT_ON_ALLOC_DEFAULT_ON \
+              -e COMPAT -e KUSER_HELPERS -e COMPAT_VDSO \
+              -d SHADOW_CALL_STACK -e LTO_NONE -d LTO_CLANG \
+              -e RELR -e INIT_STACK_NONE -d INIT_STACK_ALL_PATTERN \
+              -d INIT_STACK_ALL_ZERO -e INIT_ON_ALLOC_DEFAULT_ON \
               -d INIT_ON_FREE_DEFAULT_ON || true
           fi
-          yes "" | make O=out olddefconfig 2>&1 | tee -a build.log
+          make O=out olddefconfig 2>&1 | tee -a build.log
           export KCONFIG_NOSILENTUPDATE=1
 
+          # build
           set +e
           make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 V=1 \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
