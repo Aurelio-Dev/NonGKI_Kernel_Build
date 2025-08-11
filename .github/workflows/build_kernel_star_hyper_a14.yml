@@ -178,82 +178,40 @@ jobs:
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # 1) Resolve defconfig de forma robusta + fallback
+          # 1) Resolver defconfig
           want="${DEFCONFIG_NAME}"
-          base="${want##*/}"              # ex.: star_hyper_a14_defconfig
+          base="${want##*/}"
+          path1="arch/arm64/configs/${want}"
           found=""
-          
-          # Caminhos diretos mais óbvios
-          for p in \
-            "arch/arm64/configs/${want}" \
-            "arch/arm64/configs/${base}"
-          do
-            if [[ -f "$p" ]]; then
-              found="${p#arch/arm64/configs/}"
-              break
-            fi
-          done
-
-          # Busca no índice do git (primeiro match exato pelo nome)
-          if [[ -z "$found" ]]; then
-            cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
-            if [[ -n "$cand" ]]; then
-              found="${cand#arch/arm64/configs/}"
-            fi
+          if [[ -f "$path1" ]]; then
+            found="$want"
+          else
+            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
           fi
-
-          # Busca por prefixo (ex.: star_hyper_a14.*_defconfig)
-          if [[ -z "$found" ]]; then
-            prefix="${base%_defconfig}"
-            cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
-            if [[ -n "$cand" ]]; then
-              found="${cand#arch/arm64/configs/}"
-            fi
-          fi
-
-          # Fallbacks conhecidos (gki)
-          if [[ -z "$found" ]]; then
-            for fb in vendor/gki_defconfig gki_defconfig; do
-              if [[ -f "arch/arm64/configs/$fb" ]]; then
-                found="$fb"
-                echo "→ Fallback: usando '$fb'"
-                break
-              fi
-            done
-          fi
-
-          # Falhou geral? Liste candidatos pra ajudar
-          if [[ -z "$found" ]]; then
-            echo "::warning::Defconfig '${want}' não encontrado. Alguns candidatos:"
-            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | sed 's#arch/arm64/configs/##' | head -n 80 || true
-            echo "::error::Nenhum defconfig utilizável encontrado."
-            exit 2
-          fi
-
+          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
 
-          # 2) Gera defconfig (ARM64)
-          make O=out ARCH=arm64 "$found" V=1 2>&1 | tee build.log
+          # 2) Gera defconfig e sincroniza sem interação (SEM 'yes')
+          make O=out "$found" V=1 2>&1 | tee build.log
+          make O=out olddefconfig  2>&1 | tee -a build.log
+          make O=out syncconfig    2>&1 | tee -a build.log
 
-          # 3) Overrides **forçados** via KCONFIG_ALLCONFIG (ZRAM/ZSMALLOC desligados)
-          cat > local.overrides <<'EOF'
-          CONFIG_ZRAM=n
-          CONFIG_ZSMALLOC=n
-          EOF
-          KCONFIG_ALLCONFIG=local.overrides yes "" | make O=out ARCH=arm64 olddefconfig 2>&1 | tee -a build.log
-          grep -E '^(CONFIG_ZRAM|CONFIG_ZSMALLOC)=' out/.config || true
+          # 3) Overrides anti-ZRAM (se quiser evitar -Werror nesse driver)
+          chmod +x ./scripts/config
+          ./scripts/config --file out/.config -d CONFIG_ZRAM     || true
+          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
+          make O=out olddefconfig  2>&1 | tee -a build.log
 
           # 4) Build principal com LLVM/Clang
           set +e
-          make -j"$(nproc)" \
-               O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
+          make -j"$(nproc)" O=out LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ V=1 \
                2>&1 | tee -a build.log
           rc=${PIPESTATUS[0]}
           set -e
           exit $rc
-
 
       - name: Diagnóstico de falha (se houver)
         if: failure()
