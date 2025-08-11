@@ -18,6 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Lê o perfil, normaliza CRLF, exporta agora e persiste para próximos steps
       - name: "Carregar perfil"
         id: load_env
         shell: bash
@@ -89,36 +90,37 @@ jobs:
           fi
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: "Injetar KernelSU em drivers/kernelsu (Kconfig/Makefile)"
+      - name: "Injetar KernelSU na raiz (Kconfig/Makefile corretos)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          # Remove sobras antigas e garanta destino
-          rm -rf drivers/kernelsu
-          mkdir -p drivers
+          # Limpa tentativas antigas
+          rm -rf drivers/kernelsu || true
 
-          # Clona KernelSU diretamente no caminho esperado pelo drivers/Kconfig
-          git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" drivers/kernelsu
-
-          # Garante include e linkagem
-          if ! grep -q "subdir-ccflags-y.*drivers/kernelsu/include" drivers/Makefile 2>/dev/null || true; then
-            echo 'subdir-ccflags-y += -I$(srctree)/drivers/kernelsu/include' >> drivers/Makefile
-          fi
-          if ! grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile 2>/dev/null || true; then
-            echo 'obj-y += kernelsu/' >> drivers/Makefile
+          # Clona KernelSU na raiz (padrão oficial)
+          if [[ -d KernelSU ]]; then
+            echo "KernelSU já presente."
+          else
+            git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
           fi
 
-          # Normaliza o drivers/Kconfig para usar o caminho padronizado
-          if grep -q 'KernelSU/kernel/Kconfig' drivers/Kconfig 2>/dev/null; then
-            sed -i 's#KernelSU/kernel/Kconfig#drivers/kernelsu/Kconfig#g' drivers/Kconfig
+          # Include para headers do KernelSU
+          if ! grep -q "subdir-ccflags-y.*KernelSU/include" drivers/Makefile 2>/dev/null || true; then
+            echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
           fi
-          if grep -q 'KernelSU/Kconfig' drivers/Kconfig 2>/dev/null; then
-            sed -i 's#KernelSU/Kconfig#drivers/kernelsu/Kconfig#g' drivers/Kconfig
+
+          # Linkagem do diretório KernelSU/
+          if ! grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile 2>/dev/null || true; then
+            echo 'obj-y += KernelSU/' >> drivers/Makefile
           fi
-          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null; then
-            printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
+
+          # Normaliza drivers/Kconfig para o caminho correto
+          # troca quaisquer referências antigas por KernelSU/Kconfig e garante a presença
+          sed -i 's#drivers/kernelsu/Kconfig#KernelSU/Kconfig#g; s#KernelSU/kernel/Kconfig#KernelSU/Kconfig#g' drivers/Kconfig || true
+          if ! grep -q 'KernelSU/Kconfig' drivers/Kconfig 2>/dev/null; then
+            printf '\nsource "KernelSU/Kconfig"\n' >> drivers/Kconfig
           fi
 
       - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
@@ -126,6 +128,7 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          # Versão rápida: processa apenas arquivos de TEXTO em lote
           git ls-files -z \
             | xargs -0 file --mime-type \
             | grep 'text/' \
