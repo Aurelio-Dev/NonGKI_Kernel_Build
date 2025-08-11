@@ -139,7 +139,13 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          git ls-files | xargs -r sed -i 's/\r$//'
+          # Só arquivos regulares e de texto
+          git ls-files | while read -r f; do
+            if [[ -f "$f" ]] && file "$f" | grep -q text; then
+              sed -i 's/\r$//' "$f"
+            fi
+          done
+
 
       - name: "Hotfix: binder_gki.c include path (millet)"
         shell: bash
