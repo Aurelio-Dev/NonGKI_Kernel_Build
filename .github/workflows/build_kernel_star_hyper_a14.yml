@@ -13,7 +13,7 @@ jobs:
       ANYKERNEL_DIR: AnyKernel3
       ARCH: arm64
       SUBARCH: arm64
-      # ajuste se tiver um defconfig próprio; se não existir, cai no gki_defconfig
+      # ajuste para o seu defconfig; se não existir, cai no gki_defconfig
       DEFCONFIG: vendor/star_hyper_a14_defconfig
 
     steps:
@@ -25,27 +25,30 @@ jobs:
 
       - name: Dependências
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache clang-14 flex git libssl-dev \
-            libelf-dev lld-14 llvm-14 dwarves libncurses5-dev libncursesw5-dev \
+            bc bison build-essential ccache clang-14 lld-14 llvm-14 flex git \
+            libssl-dev libelf-dev dwarves libncurses5-dev libncursesw5-dev \
             python3 zip unzip rsync cmake pkg-config libyaml-dev
 
-          # Aponta clang/lld padrão para a versão 14 (evita binutils antigos quebrando LSE, etc)
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 140 \
-                                   --slave /usr/bin/clang++ clang++ /usr/bin/clang++-14 \
-                                   --slave /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-14 \
-                                   --slave /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-14 \
-                                   --slave /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-14 \
-                                   --slave /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-14 \
-                                   --slave /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-14
+          # Exporta ferramentas (sem mexer no update-alternatives)
+          echo "LLVM=1"              >> "$GITHUB_ENV"
+          echo "CC=clang-14"         >> "$GITHUB_ENV"
+          echo "HOSTCC=clang-14"     >> "$GITHUB_ENV"
+          echo "LD=ld.lld-14"        >> "$GITHUB_ENV"
+          echo "AR=llvm-ar-14"       >> "$GITHUB_ENV"
+          echo "NM=llvm-nm-14"       >> "$GITHUB_ENV"
+          echo "OBJCOPY=llvm-objcopy-14" >> "$GITHUB_ENV"
+          echo "OBJDUMP=llvm-objdump-14" >> "$GITHUB_ENV"
+          echo "STRIP=llvm-strip-14" >> "$GITHUB_ENV"
 
-      # === Clone da fonte do kernel (mantenha sua origem atual; exemplo robusto) ===
+      # === Clone da fonte do kernel (exemplo robusto; troque pela sua origem se quiser) ===
       - name: Clonar fonte do Kernel (robusto a branch ausente)
         run: |
           set -euxo pipefail
           if [ ! -d "${KERNEL_DIR}" ]; then
-            # Troque a URL/branch abaixo pela sua origem real
+            # Troque pela sua origem de kernel se necessário
             git clone --depth=1 https://github.com/arter97/android_kernel_common ${KERNEL_DIR} || true
           fi
           cd "${KERNEL_DIR}"
@@ -57,32 +60,29 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Clona KernelSU temporariamente
           rm -rf ../_ksu_tmp
           git clone --depth=1 https://github.com/tiann/KernelSU ../_ksu_tmp
 
-          # Copia a pasta drivers/kernelsu
+          # Copia código
           mkdir -p drivers
           rsync -a ../_ksu_tmp/kernel/drivers/kernelsu/ drivers/kernelsu/
 
-          # Copia os headers necessários (ksu*.h)
+          # Copia headers (ksu*.h)
           rsync -a --include="ksu*.h" --include="*/" --exclude="*" \
             ../_ksu_tmp/kernel/include/linux/ include/linux/
 
           rm -rf ../_ksu_tmp
 
-          # Garante include no Kconfig de drivers
+          # Garante include no Kconfig
           if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
-            # insere antes do 'endmenu' final
             sed -i '/endmenu/i\source "drivers\/kernelsu\/Kconfig"' drivers/Kconfig
           fi
 
-          # Garante entrada no Makefile de drivers
+          # Garante entrada no Makefile
           if ! grep -q 'kernelsu/' drivers/Makefile; then
             echo 'obj-$(CONFIG_KERNELSU) += kernelsu/' >> drivers/Makefile
           fi
 
-      # === Limpeza leve do OUT (não apagar árvore fonte) ===
       - name: Preparar OUT
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -90,53 +90,51 @@ jobs:
           rm -rf "${OUT_DIR}"
           mkdir -p "${OUT_DIR}"
 
-      # === Defconfig não-interativa (evita "explicit update") ===
+      # === Defconfig não-interativo ===
       - name: Gerar .config (não-interativo)
         working-directory: ${{ env.KERNEL_DIR }}
         env:
-          LLVM: 1
-          CC: clang
-          HOSTCC: clang
           ARCH: ${{ env.ARCH }}
           SUBARCH: ${{ env.SUBARCH }}
         run: |
           set -euxo pipefail
 
-          # Se o defconfig indicado não existir, cair para gki_defconfig
           if ! [ -f "arch/arm64/configs/${DEFCONFIG}" ]; then
             echo "Warning: ${DEFCONFIG} não encontrado; usando gki_defconfig"
-            make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} LLVM=1 CC=clang HOSTCC=clang gki_defconfig
+            make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} \
+                 LLVM=$LLVM CC="$CC" HOSTCC="$HOSTCC" gki_defconfig
           else
-            make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} LLVM=1 CC=clang HOSTCC=clang "${DEFCONFIG}"
+            make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} \
+                 LLVM=$LLVM CC="$CC" HOSTCC="$HOSTCC" "${DEFCONFIG}"
           fi
 
-          # Força opções necessárias no .config
+          # Força opções chave
           "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --enable  KERNELSU || true
           "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --disable LTO_CLANG || true
-          "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --disable THINLTO || true
-          "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --enable  LTO_NONE || true
+          "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --disable THINLTO   || true
+          "${PWD}/scripts/config" --file "${OUT_DIR}/.config" --enable  LTO_NONE  || true
 
-          # Resolve quaisquer novas opções sem interação
-          yes "" | make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} LLVM=1 CC=clang HOSTCC=clang olddefconfig
+          # Resolve novas opções sem interação (evita Broken pipe com pipefail)
+          set +o pipefail
+          yes "" | make O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} \
+                 LLVM=$LLVM CC="$CC" HOSTCC="$HOSTCC" olddefconfig | tee -a "${OUT_DIR}/_olddefconfig.log"
+          set -o pipefail
 
-      # === Build (Image + dtbs) ===
+      # === Compilar ===
       - name: Compilar Kernel (olddefconfig + build, com log)
         working-directory: ${{ env.KERNEL_DIR }}
         env:
-          LLVM: 1
-          CC: clang
-          HOSTCC: clang
           ARCH: ${{ env.ARCH }}
           SUBARCH: ${{ env.SUBARCH }}
         run: |
           set -euxo pipefail
-          # flags padrões para evitar warnings fatais com clang
           export KCFLAGS="-Wno-error"
           make -j"$(nproc)" O="${OUT_DIR}" ARCH=${ARCH} SUBARCH=${SUBARCH} \
-               LLVM=1 CC=clang HOSTCC=clang \
-               Image.gz-dtb
+               LLVM=$LLVM CC="$CC" HOSTCC="$HOSTCC" \
+               LD="$LD" AR="$AR" NM="$NM" OBJCOPY="$OBJCOPY" OBJDUMP="$OBJDUMP" STRIP="$STRIP" \
+               Image.gz-dtb 2>&1 | tee "${OUT_DIR}/build.log"
 
-      # === Empacotar com AnyKernel3 (se você já tem este diretório no repo) ===
+      # === Empacotar (opcional) ===
       - name: Empacotar com AnyKernel3
         if: ${{ always() }}
         run: |
@@ -149,12 +147,13 @@ jobs:
             echo "AnyKernel3 ausente ou Image.gz-dtb não gerada; pulando empacote."
           fi
 
-      - name: Publicar artefato
+      - name: Publicar artefatos
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: debug-kernel-logs
           path: |
             ${{ env.KERNEL_DIR }}/out/build.log
+            ${{ env.KERNEL_DIR }}/out/_olddefconfig.log
             debug-kernel-ksu.zip
           if-no-files-found: warn
