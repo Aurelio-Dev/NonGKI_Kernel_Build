@@ -94,33 +94,26 @@ jobs:
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          # Limpa tentativas anteriores
           rm -rf KernelSU drivers/kernelsu drivers/KernelSU ksu_tmp || true
           mkdir -p drivers
 
-          # Clona em tmp
           git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" ksu_tmp
 
-          # Descobre onde estão Makefile/Kconfig "reais"
           CAND_DIR=""
           for d in "ksu_tmp/KernelSU" "ksu_tmp/kernel" "ksu_tmp"; do
             if [[ -f "$d/Makefile" ]]; then CAND_DIR="$d"; break; fi
           done
           [[ -n "$CAND_DIR" ]] || { echo "::error::Não achei Makefile do KernelSU no repositório"; exit 2; }
 
-          # Copia nivelado para drivers/kernelsu
           mkdir -p drivers/kernelsu
           cp -a "${CAND_DIR}/." drivers/kernelsu/
 
-          # Se Kconfig estiver em kernel/Kconfig, crie alias no topo
           if [[ ! -f drivers/kernelsu/Kconfig && -f drivers/kernelsu/kernel/Kconfig ]]; then
             cp -f drivers/kernelsu/kernel/Kconfig drivers/kernelsu/Kconfig
           fi
 
-          # Symlink com maiúscula para satisfazer referências antigas
           ln -sfn kernelsu drivers/KernelSU
 
-          # Ajusta Makefile e Kconfig (remove velhos, adiciona novos e deduplica)
           sed -i '/obj-y[[:space:]]\+\+=\s*KernelSU\//d' drivers/Makefile || true
           sed -i '/source\s*"drivers\/KernelSU\/Kconfig"/d' drivers/Kconfig || true
 
@@ -159,8 +152,8 @@ jobs:
           set -euxo pipefail
           cd "$KERNEL_DIR"
           f="fs/erofs/inode.c"
-          if [[ -f "$f" ]] && grep -qE '\bloff_t[[:space:]]+off;' "$f"; then
-            sed -i 's/\bloff_t[[:space:]]\+off;/__maybe_unused loff_t off;/' "$f"
+          if [[ -f "$f" ]] && grep -qE '^[[:space:]]*loff_t[[:space:]]+off;[[:space:]]*$' "$f"; then
+            sed -i 's/^\([[:space:]]*\)loff_t[[:space:]]\+off;$/\1__maybe_unused loff_t off;/' "$f"
             echo "→ Hotfix aplicado em $f"
           fi
 
@@ -174,7 +167,6 @@ jobs:
             export PATH="${CLANG_DIR}/bin:${PATH}"
           fi
 
-          # === Detecta defconfig automaticamente ===
           want="${DEFCONFIG_NAME}"
           base="${want##*/}"
           path1="arch/arm64/configs/${want}"
@@ -211,13 +203,12 @@ jobs:
 
           echo "→ Defconfig selecionado: $found"
           make O=out "$found" V=1 2>&1 | tee build.log
-          # evita prompts do kconfig
           make O=out olddefconfig 2>&1 | tee -a build.log
 
-          # Build principal com log completo
           set +e
           make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 V=1 \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               KCFLAGS="-Wno-error=unused-variable -Wno-error=unused-function" \
                2>&1 | tee -a build.log
           MAKE_RC=${PIPESTATUS[0]}
           set -e
