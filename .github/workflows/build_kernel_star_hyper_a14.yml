@@ -18,7 +18,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Lê o perfil, normaliza CRLF, exporta agora e persiste para próximos steps
       - name: "Carregar perfil"
         id: load_env
         shell: bash
@@ -97,17 +96,17 @@ jobs:
 
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: "Injetar KernelSU (robusto a submódulo vazio; garante KernelSU/Kconfig)"
+      - name: "Injetar KernelSU (robusto; garante KernelSU/Kconfig)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          # Se existir, checar se é repo válido e contém Kconfig
+          # Se existir e estiver vazio/submódulo, recria
           need_clone=0
           if [[ -d KernelSU ]]; then
             if [[ ! -d KernelSU/.git ]] || { [[ ! -f KernelSU/Kconfig ]] && [[ ! -f KernelSU/kernel/Kconfig ]] ; }; then
-              echo "→ KernelSU existe mas está vazio/submódulo não inicializado. Recriando…"
+              echo "→ KernelSU existe mas está vazio/submódulo. Recriando…"
               rm -rf KernelSU
               need_clone=1
             fi
@@ -121,7 +120,7 @@ jobs:
             echo "KernelSU já presente e utilizável."
           fi
 
-          # Garante include e linkagem
+          # Include e linkagem no Makefile
           if ! grep -q "subdir-ccflags-y.*KernelSU/include" drivers/Makefile 2>/dev/null || true; then
             echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
           fi
@@ -129,7 +128,7 @@ jobs:
             echo 'obj-y += KernelSU/' >> drivers/Makefile
           fi
 
-          # Garante que exista KernelSU/Kconfig (se só existir KernelSU/kernel/Kconfig, copia)
+          # Garante KernelSU/Kconfig (copia se só existir em KernelSU/kernel/Kconfig)
           if [[ ! -f KernelSU/Kconfig ]]; then
             if [[ -f KernelSU/kernel/Kconfig ]]; then
               cp -f KernelSU/kernel/Kconfig KernelSU/Kconfig
@@ -155,22 +154,11 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          # Versão rápida: processa apenas arquivos de TEXTO em lote
           git ls-files -z \
             | xargs -0 file --mime-type \
             | grep 'text/' \
             | cut -d: -f1 \
             | xargs -r sed -i 's/\r$//'
-
-      - name: "Hotfix: binder_gki.c include path (millet)"
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-          f="drivers/android/binder_gki.c"
-          if [[ -f "$f" ]]; then
-            sed -i 's|#include <uapi/linux/android/binder.h>|#include <linux/android/binder.h>|' "$f" || true
-          fi
 
       - name: "Compilar Kernel (defconfig + build)"
         shell: bash
@@ -183,7 +171,48 @@ jobs:
             export PATH="${CLANG_DIR}/bin:${PATH}"
           fi
 
-          make O=out "${DEFCONFIG_NAME}"
+          # === Detecta defconfig automaticamente ===
+          want="${DEFCONFIG_NAME}"
+          base="${want##*/}"                         # ex.: star_hyper_a14_defconfig
+          path1="arch/arm64/configs/${want}"
+          found=""
+
+          if [[ -f "$path1" ]]; then
+            found="$want"
+          else
+            # tenta procurar pelo mesmo nome em qualquer subpasta
+            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
+            if [[ -n "$cand" ]]; then
+              found="${cand#arch/arm64/configs/}"
+            else
+              # tenta variantes: sem vendor/, prefixo, etc.
+              prefix="${base%_defconfig}"
+              cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
+              [[ -z "$cand" ]] && cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
+              if [[ -n "$cand" ]]; then
+                found="${cand#arch/arm64/configs/}"
+              fi
+            fi
+          fi
+
+          if [[ -z "$found" ]]; then
+            echo "::warning::Defconfig '${want}' não encontrado. Listando alguns candidatos:"
+            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -n 200 || true
+            # fallbacks comuns
+            for fb in vendor/gki_defconfig gki_defconfig; do
+              if [[ -f "arch/arm64/configs/$fb" ]]; then found="$fb"; echo "→ Usando fallback: $fb"; break; fi
+            done
+          fi
+
+          if [[ -z "$found" ]]; then
+            echo "::error::Nenhum defconfig compatível encontrado (queria '${want}')."
+            exit 2
+          fi
+
+          echo "→ Defconfig selecionado: $found"
+          make O=out "$found"
+
+          # === Build ===
           make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
