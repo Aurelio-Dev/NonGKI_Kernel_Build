@@ -214,7 +214,10 @@ jobs:
               -d INIT_ON_FREE_DEFAULT_ON || true
           fi
           make O=out olddefconfig 2>&1 | tee -a build.log
-          export KCONFIG_NOSILENTUPDATE=1
+          # garante timestamp mais novo da .config
+          touch out/.config
+          # NÃO trave o syncconfig (evita "requires explicit update")
+          unset KCONFIG_NOSILENTUPDATE || true
 
           # build
           set +e
