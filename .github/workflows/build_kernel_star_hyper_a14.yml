@@ -1,228 +1,221 @@
-name: Build Kernel • star_hyper_a14
+name: build
 
 on:
   workflow_dispatch:
     inputs:
       PROFILE_NAME:
-        description: "Arquivo de perfil em Profiles/ (ex.: star_hyper_a14.env)"
+        description: "Nome do arquivo de perfil em Profiles/ (ex.: star_hyper_a14.env)"
         required: true
         default: "star_hyper_a14.env"
-      PYTHON_VERSION:
-        description: "Versão do Python para toolings (2 ou 3)"
-        required: true
-        default: "3"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
-    env:
-      TZ: America/Sao_Paulo
-      PROFILE_NAME: ${{ inputs.PROFILE_NAME }}
-      PYTHON_VERSION: ${{ inputs.PYTHON_VERSION }}
-
     steps:
-      - name: Checkout repositório
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Mostrar versões do runner
-        run: |
-          set -euxo pipefail
-          uname -a
-          gcc --version || true
-          clang --version || true
-          python3 --version || true
-          git --version
-
+      # ────────────────────────────────────────────────────────────────────────────
+      # Lê Profiles/${PROFILE_NAME}, normaliza CRLF e exporta tudo para GITHUB_ENV
+      # ────────────────────────────────────────────────────────────────────────────
       - name: Carregar perfil
         id: load_env
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          # Garante diretório e arquivo do perfil
           mkdir -p Profiles
-          test -f "Profiles/${PROFILE_NAME}"
-          echo "→ Perfil: Profiles/${PROFILE_NAME}"
+          if [[ ! -f "Profiles/${{ github.event.inputs.PROFILE_NAME }}" ]]; then
+            echo "::error::Arquivo de perfil não encontrado: Profiles/${{ github.event.inputs.PROFILE_NAME }}"
+            echo "Arquivos disponíveis em Profiles/:"
+            ls -la Profiles || true
+            exit 2
+          fi
 
-          # Normaliza final de linha (CRLF -> LF)
-          sed -i 's/\r$//' "Profiles/${PROFILE_NAME}"
+          echo "→ Usando perfil: Profiles/${{ github.event.inputs.PROFILE_NAME }}"
+          # Normaliza CRLF -> LF
+          sed -i 's/\r$//' "Profiles/${{ github.event.inputs.PROFILE_NAME }}"
 
-          # Exporta KEY=VALUE
-          while IFS= read -r raw || [ -n "$raw" ]; do
-            [ -z "$raw" ] && continue
-            case "$raw" in \#*) continue;; esac
+          # Exporta KEY=VALUE válidos
+          while IFS= read -r raw || [[ -n "$raw" ]]; do
+            # ignora vazios e comentários
+            [[ -z "$raw" ]] && continue
+            [[ "$raw" =~ ^[[:space:]]*# ]] && continue
+
             if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
-              k="${raw%%=*}"; v="${raw#*=}"
+              k="${raw%%=*}"
+              v="${raw#*=}"
+              # remove aspas de envoltória, se houver
               v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+              # remove \r restantes
               k="${k%$'\r'}"; v="${v%$'\r'}"
               echo "$k=$v" >> "$GITHUB_ENV"
               printf '  %s=%s\n' "$k" "$v"
             fi
-          done < "Profiles/${PROFILE_NAME}"
+          done < "Profiles/${{ github.event.inputs.PROFILE_NAME }}"
 
-          # Guard-rails
-          test -n "${KERNEL_SOURCE:-}"  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
-          test -n "${DEFCONFIG_NAME:-}" || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
-
-
+          # Guard-rails mínimos para seguir o build
+          : "${KERNEL_SOURCE:?::error::KERNEL_SOURCE não definido no perfil}"
+          : "${DEFCONFIG_NAME:?::error::DEFCONFIG_NAME não definido no perfil}"
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
-        if: ${{ env.CLANG_SOURCE != '' }}
+        if: env.CLANG_SOURCE != ''
+        shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/clang"
-          curl -L --retry 3 --retry-delay 3 "$CLANG_SOURCE" -o /tmp/clang.tar.xz
-          tar -xJf /tmp/clang.tar.xz -C "$GITHUB_WORKSPACE/clang" --strip-components=1
-          echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
-          echo "LLVM=1"        >> $GITHUB_ENV
-          echo "LLVM_IAS=1"    >> $GITHUB_ENV
-          echo "LD=ld.lld"     >> $GITHUB_ENV
+          sudo apt-get update
+          sudo apt-get install -y xz-utils
+          mkdir -p toolchains && cd toolchains
+          curl -L "$CLANG_SOURCE" -o clang.tar.xz
+          tar -xJf clang.tar.xz
+          CLANG_DIR="$(find "$(pwd)" -maxdepth 1 -type d -name '*clang*' | head -n1)"
+          echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
 
       - name: Instalar toolchain fallback (se não baixou clang)
-        if: ${{ env.CLANG_SOURCE == '' }}
+        if: env.CLANG_SOURCE == ''
+        shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev \
-              libelf-dev ccache python3 python2 curl git rsync lz4 \
-              gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-          echo "CROSS_COMPILE_ARM32=arm-linux-gnueabi-" >> $GITHUB_ENV
+                                  libncurses5-dev git wget curl jq python3 ccache \
+                                  clang lld llvm
 
+      # ────────────────────────────────────────────────────────────────────────────
+      # Clonar fonte do Kernel (robusto a branch ausente; suporta KERNEL_REF)
+      # ────────────────────────────────────────────────────────────────────────────
       - name: Clonar fonte do Kernel (robusto a branch ausente)
+        id: clone_kernel
+        shell: bash
         run: |
           set -euxo pipefail
-          rm -rf device_kernel
+          git --version
 
-          SRC="${KERNEL_SOURCE}"
-          # KERNEL_REF tem prioridade; se vazio, usa KERNEL_BRANCH; se não existir, cai no default branch
-          REF="${KERNEL_REF:-${KERNEL_BRANCH:-}}"
+          if [[ -d kernel-src ]]; then rm -rf kernel-src; fi
 
-          find_ref() {
-            # retorna 0 se a ref existe como head ou tag
-            if git ls-remote --heads "$SRC" "$1" | grep -q .; then
-              echo "::notice::Encontrado branch '$1' no remoto."
-              return 0
+          if [[ -n "${KERNEL_REF:-}" ]]; then
+            echo "Clonando por referência direta (KERNEL_REF=$KERNEL_REF)"
+            git clone --depth 1 --branch "$KERNEL_REF" "$KERNEL_SOURCE" kernel-src || {
+              echo "::error::Falha ao clonar ref $KERNEL_REF do $KERNEL_SOURCE"
+              exit 2
+            }
+          else
+            echo "Tentando branch: ${KERNEL_BRANCH:-<vazio>}"
+            if [[ -n "${KERNEL_BRANCH:-}" ]]; then
+              if git ls-remote --exit-code --heads "$KERNEL_SOURCE" "$KERNEL_BRANCH" >/dev/null 2>&1; then
+                git clone --depth 1 --branch "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel-src
+              else
+                echo "Branch $KERNEL_BRANCH não existe no remoto, detectando branch padrão…"
+                default_branch="$(git ls-remote --symref "$KERNEL_SOURCE" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
+                echo "→ default: $default_branch"
+                git clone --depth 1 --branch "$default_branch" "$KERNEL_SOURCE" kernel-src
+              fi
+            else
+              echo "KERNEL_BRANCH vazio, clonando branch padrão…"
+              default_branch="$(git ls-remote --symref "$KERNEL_SOURCE" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
+              echo "→ default: $default_branch"
+              git clone --depth 1 --branch "$default_branch" "$KERNEL_SOURCE" kernel-src
             fi
-            if git ls-remote --tags "$SRC" "$1" | grep -q .; then
-              echo "::notice::Encontrado tag '$1' no remoto."
-              return 0
-            fi
-            return 1
-          }
-
-          if [ -n "$REF" ]; then
-            if find_ref "$REF"; then
-              git clone --depth=1 -b "$REF" "$SRC" device_kernel
-              echo "KERNEL_TREE=$(pwd)/device_kernel" >> $GITHUB_ENV
-              exit 0
-            fi
-            # Pode ser commit/ref arbitrária: clona padrão e dá fetch/checkout da ref
-            if git ls-remote "$SRC" | grep -qi "$REF"; then
-              git clone --depth=1 "$SRC" device_kernel
-              cd device_kernel
-              git fetch --depth=1 origin "$REF"
-              git checkout --detach FETCH_HEAD
-              cd ..
-              echo "::notice::Usando ref arbitrária '$REF' (commit/ref)."
-              echo "KERNEL_TREE=$(pwd)/device_kernel" >> $GITHUB_ENV
-              exit 0
-            fi
-            echo "::warning::Referência '$REF' não encontrada; usando branch padrão do repositório."
           fi
 
-          # Descobre o branch padrão do repo
-          DEFAULT_BRANCH="$(git ls-remote --symref "$SRC" HEAD | awk '/^ref:/{print $2}' | sed 's#refs/heads/##')"
-          echo "::notice::Branch padrão do repositório: ${DEFAULT_BRANCH}"
-          git clone --depth=1 -b "$DEFAULT_BRANCH" "$SRC" device_kernel
+          echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-          echo "KERNEL_TREE=$(pwd)/device_kernel" >> $GITHUB_ENV
-
-      # ---------------------------------------------------------
-      # KernelSU — injeta de forma idempotente
-      # ---------------------------------------------------------
       - name: Injetar KernelSU no tree do kernel
+        shell: bash
         run: |
           set -euxo pipefail
-          cd "$KERNEL_TREE"
+          cd "$KERNEL_DIR"
 
-          KS_DIR="drivers/kernelsu"
-          # limpa qualquer arquivo/dir existente
-          rm -rf "$KS_DIR"
-          mkdir -p "$KS_DIR"
+          # Skip se já existir
+          if [[ -d KernelSU ]]; then
+            echo "KernelSU já presente."
+          else
+            git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
+          fi
 
-          git clone --depth=1 -b "${KERNELSU_BRANCH}" "${KERNELSU_SOURCE}" /tmp/KernelSU
-          cp -av /tmp/KernelSU/kernel/* "$KS_DIR"/
-
-          # inclui no Kconfig/Makefile principais (evita duplicação)
-          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
-            echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
-
-          grep -q 'obj-$(CONFIG_KSU)      += kernelsu/' drivers/Makefile || \
-            echo 'obj-$(CONFIG_KSU)      += kernelsu/' >> drivers/Makefile
+          if ! grep -q "subdir-ccflags-y.*KernelSU/include" drivers/Makefile 2>/dev/null || true; then
+            echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
+          fi
+          if ! grep -q "obj-y.*\bKernelSU/\b" drivers/Makefile 2>/dev/null || true; then
+            echo 'obj-y += KernelSU/' >> drivers/Makefile
+          fi
 
       - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
+        shell: bash
         run: |
           set -euxo pipefail
-          cd "$KERNEL_TREE"
-          find . -type f \( -name "Makefile" -o -name "Kconfig" -o -name "*.mk" -o -name "*.cfg" \) -print0 \
-            | xargs -0 sed -i 's/\r$//'
+          cd "$KERNEL_DIR"
+          # normaliza CRLF no repo inteiro (útil em forks)
+          git ls-files | xargs -r sed -i 's/\r$//'
 
-      # Hotfix opcional: binder_gki.c (millet) – troca include angulado por include com aspas
       - name: Hotfix:binder_gki.c include path (millet)
+        shell: bash
         run: |
           set -euxo pipefail
-          cd "$KERNEL_TREE"
-          FILE="drivers/mihw/millet/binder_gki.c"
-          if [ -f "$FILE" ]; then
-            echo "::notice::Aplicando hotfix no $FILE"
-            sed -i 's|#include <\(\.\./\.\./android/binder_internal\.h\)>|#include "\1"|' "$FILE" || true
-            sed -i 's|#include <android/binder_internal\.h>|#include "android/binder_internal.h"|' "$FILE" || true
+          cd "$KERNEL_DIR"
+          f="drivers/android/binder_gki.c"
+          if [[ -f "$f" ]]; then
+            sed -i 's|#include <uapi/linux/android/binder.h>|#include <linux/android/binder.h>|' "$f" || true
           fi
 
       - name: Compilar Kernel (defconfig + build)
+        shell: bash
         run: |
           set -euxo pipefail
-          cd "$KERNEL_TREE"
+          cd "$KERNEL_DIR"
 
-          echo "Usando defconfig: ${DEFCONFIG_NAME}"
           export ARCH=arm64
           export SUBARCH=arm64
+          export LC_ALL=C
 
-          make -j"$(nproc)" "${DEFCONFIG_NAME}"
+          # Define toolchain (clang local se existir; caso contrário, clang do sistema)
+          if [[ -n "${CLANG_DIR:-}" && -d "${CLANG_DIR}" ]]; then
+            export PATH="${CLANG_DIR}/bin:${PATH}"
+            export CC="clang"
+            export LD="ld.lld"
+          else
+            export CC="clang"
+            export LD="ld.lld"
+          fi
 
-          make -j"$(nproc)" \
-            ${LLVM:+LLVM=1} \
-            ${LLVM_IAS:+LLVM_IAS=1} \
-            ${LD:+LD=$LD} \
-            ${CROSS_COMPILE:+CROSS_COMPILE=$CROSS_COMPILE} \
-            ${CROSS_COMPILE_ARM32:+CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32}
+          # Defconfig do perfil
+          make O=out "${DEFCONFIG_NAME}"
 
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          for f in \
-            arch/arm64/boot/Image.gz-dtb \
-            arch/arm64/boot/Image.gz \
-            arch/arm64/boot/Image \
-            out/arch/arm64/boot/Image.gz-dtb \
-            out/arch/arm64/boot/Image.gz \
-            out/arch/arm64/boot/Image; do
-            [ -f "$f" ] && cp -av "$f" "$GITHUB_WORKSPACE/out/" || true
-          done
+          # Build
+          make -j"$(nproc)" O=out \
+               CC="${CC}" LD="${LD}" \
+               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+
+          # Confere artefatos
+          ls -la out/arch/arm64/boot || true
 
       - name: Empacotar com AnyKernel3
+        shell: bash
         run: |
           set -euxo pipefail
           cd "$GITHUB_WORKSPACE"
           rm -rf AnyKernel3
-          git clone --depth=1 "${AK3_SOURCE}" -b "${AK3_BRANCH}" AnyKernel3
-          cp -av out/* AnyKernel3/ || true
+          git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
+
+          # Copia Image.gz-dtb (ou Image.gz + dtb) — ajuste se o seu tree gerar outro artefato
+          KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
+          if [[ ! -f "$KIMG" ]]; then
+            echo "::error::Kernel Image não encontrado em $KIMG"
+            ls -la "$KERNEL_DIR/out/arch/arm64/boot" || true
+            exit 2
+          fi
+          cp -fv "$KIMG" AnyKernel3/
+
           cd AnyKernel3
-          zip -r9 "$GITHUB_WORKSPACE/Kernel-star_hyper_a14-$(date +%Y%m%d-%H%M).zip" ./
+          zip -r9 "../kernel-${ROM_TEXT:-build}.zip" . -x "*.git*"
+
+          echo "ZIP_PATH=$GITHUB_WORKSPACE/kernel-${ROM_TEXT:-build}.zip" >> "$GITHUB_ENV"
 
       - name: Publicar artefato
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-star_hyper_a14
-          path: |
-            out/**
-            *.zip
+          name: kernel-${{ env.ROM_TEXT || 'build' }}
+          path: ${{ env.ZIP_PATH }}
