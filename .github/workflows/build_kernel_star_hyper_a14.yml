@@ -178,21 +178,61 @@ jobs:
           set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # 1) Localiza defconfig desejado
+          # 1) Resolve defconfig de forma robusta + fallback
           want="${DEFCONFIG_NAME}"
-          base="${want##*/}"
-          path1="arch/arm64/configs/${want}"
+          base="${want##*/}"              # ex.: star_hyper_a14_defconfig
           found=""
-          if [[ -f "$path1" ]]; then
-            found="$want"
-          else
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
+          
+          # Caminhos diretos mais óbvios
+          for p in \
+            "arch/arm64/configs/${want}" \
+            "arch/arm64/configs/${base}"
+          do
+            if [[ -f "$p" ]]; then
+              found="${p#arch/arm64/configs/}"
+              break
+            fi
+          done
+
+          # Busca no índice do git (primeiro match exato pelo nome)
+          if [[ -z "$found" ]]; then
+            cand="$(git ls-files arch/arm64/configs | grep -E "/${base}$" | head -n1 || true)"
+            if [[ -n "$cand" ]]; then
+              found="${cand#arch/arm64/configs/}"
+            fi
           fi
-          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
+
+          # Busca por prefixo (ex.: star_hyper_a14.*_defconfig)
+          if [[ -z "$found" ]]; then
+            prefix="${base%_defconfig}"
+            cand="$(git ls-files arch/arm64/configs | grep -E "/${prefix}.*_defconfig$" | head -n1 || true)"
+            if [[ -n "$cand" ]]; then
+              found="${cand#arch/arm64/configs/}"
+            fi
+          fi
+
+          # Fallbacks conhecidos (gki)
+          if [[ -z "$found" ]]; then
+            for fb in vendor/gki_defconfig gki_defconfig; do
+              if [[ -f "arch/arm64/configs/$fb" ]]; then
+                found="$fb"
+                echo "→ Fallback: usando '$fb'"
+                break
+              fi
+            done
+          fi
+
+          # Falhou geral? Liste candidatos pra ajudar
+          if [[ -z "$found" ]]; then
+            echo "::warning::Defconfig '${want}' não encontrado. Alguns candidatos:"
+            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | sed 's#arch/arm64/configs/##' | head -n 80 || true
+            echo "::error::Nenhum defconfig utilizável encontrado."
+            exit 2
+          fi
+
           echo "→ Usando defconfig: $found"
 
-          # 2) Gera defconfig (ARM64) e abre log
+          # 2) Gera defconfig (ARM64)
           make O=out ARCH=arm64 "$found" V=1 2>&1 | tee build.log
 
           # 3) Overrides **forçados** via KCONFIG_ALLCONFIG (ZRAM/ZSMALLOC desligados)
@@ -213,6 +253,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           exit $rc
+
 
       - name: Diagnóstico de falha (se houver)
         if: failure()
