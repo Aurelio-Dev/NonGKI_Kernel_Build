@@ -153,8 +153,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-
-          # Resolver defconfig
+      
+          # 1) Resolver defconfig
           want="${DEFCONFIG_NAME}"
           base="${want##*/}"
           path1="arch/arm64/configs/${want}"
@@ -165,33 +165,31 @@ jobs:
             cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
             [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
           fi
-          [[ -z "$found" ]] && found="gki_defconfig"
+          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
-
-          # Defconfig + olddefconfig não interativo
-          make O=out ARCH=arm64 "$found" V=1 2>&1 | tee build.log
-          yes "" | make O=out ARCH=arm64 olddefconfig 2>&1 | tee -a build.log
-
-          # Força: ZRAM off, ZSMALLOC on (evita NR_ZSPAGES em taskstats)
+      
+          # 2) Gerar .config
+          make O=out ARCH=arm64 "$found" V=1        2>&1 | tee  build.log
+          make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
+          make O=out ARCH=arm64 syncconfig          2>&1 | tee -a build.log
+      
+          # 3) (Opcional) overrides – sem 'yes'
           chmod +x ./scripts/config
-          ./scripts/config --file out/.config -d CONFIG_ZRAM || true
-          ./scripts/config --file out/.config -e CONFIG_ZSMALLOC || true
-          yes "" | make O=out ARCH=arm64 olddefconfig 2>&1 | tee -a build.log
-
-          echo "→ Checando .config:"
-          egrep -n 'CONFIG_(ZRAM|ZSMALLOC)=' out/.config || true
-
-          # Build (desativa Werror globalmente)
+          ./scripts/config --file out/.config -d CONFIG_ZRAM     || true
+          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
+          make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
+      
+          # 4) Build
           set +e
           make -j"$(nproc)" \
                O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-               HOSTCC=clang HOSTCXX=clang++ \
-               KCFLAGS="-Wno-error" KCPPFLAGS="-Wno-error" WERROR=0 \
-               V=1 2>&1 | tee -a build.log
+               HOSTCC=clang HOSTCXX=clang++ V=1 \
+               2>&1 | tee -a build.log
           rc=${PIPESTATUS[0]}
           set -e
           exit $rc
+
 
       - name: Diagnóstico de falha (se houver)
         if: failure()
