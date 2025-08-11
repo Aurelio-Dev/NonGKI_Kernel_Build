@@ -13,12 +13,12 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Carregar perfil
+      - name: "Carregar perfil"
         id: load_env
         shell: bash
         run: |
@@ -53,21 +53,21 @@ jobs:
           : "${KERNEL_SOURCE:?::error::KERNEL_SOURCE não definido no perfil}"
           : "${DEFCONFIG_NAME:?::error::DEFCONFIG_NAME não definido no perfil}"
 
-      - name: (Opcional) Baixar LLVM/Clang do perfil
-        if: env.CLANG_SOURCE != ''
+      - name: "(Opcional) Baixar LLVM/Clang do perfil"
+        if: ${{ env.CLANG_SOURCE != '' }}
         shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y xz-utils
+          sudo apt-get install -y xz-utils curl
           mkdir -p toolchains && cd toolchains
           curl -L "$CLANG_SOURCE" -o clang.tar.xz
           tar -xJf clang.tar.xz
           CLANG_DIR="$(find "$(pwd)" -maxdepth 1 -type d -name '*clang*' | head -n1)"
           echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
 
-      - name: Instalar toolchain fallback (se não baixou clang)
-        if: env.CLANG_SOURCE == ''
+      - name: "Instalar toolchain fallback (se não baixou clang)"
+        if: ${{ env.CLANG_SOURCE == '' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -76,7 +76,7 @@ jobs:
                                   libncurses5-dev git wget curl jq python3 ccache \
                                   clang lld llvm
 
-      - name: Clonar fonte do Kernel (robusto a branch ausente)
+      - name: "Clonar fonte do Kernel (robusto a branch ausente)"
         id: clone_kernel
         shell: bash
         run: |
@@ -101,7 +101,7 @@ jobs:
 
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: Injetar KernelSU no tree do kernel
+      - name: "Injetar KernelSU no tree do kernel"
         shell: bash
         run: |
           set -euxo pipefail
@@ -118,14 +118,14 @@ jobs:
             echo 'obj-y += KernelSU/' >> drivers/Makefile
           fi
 
-      - name: Sanear Makefiles/Config (CRLF/BOM/TAB)
+      - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
           git ls-files | xargs -r sed -i 's/\r$//'
 
-      - name: Hotfix: binder_gki.c include path (millet)
+      - name: "Hotfix: binder_gki.c include path (millet)"
         shell: bash
         run: |
           set -euxo pipefail
@@ -135,7 +135,7 @@ jobs:
             sed -i 's|#include <uapi/linux/android/binder.h>|#include <linux/android/binder.h>|' "$f" || true
           fi
 
-      - name: Compilar Kernel (defconfig + build)
+      - name: "Compilar Kernel (defconfig + build)"
         shell: bash
         run: |
           set -euxo pipefail
@@ -147,12 +147,12 @@ jobs:
           fi
 
           make O=out "${DEFCONFIG_NAME}"
-          make -j"$(nproc)" O=out CC=clang LD=ld.lld \
+          make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
           ls -la out/arch/arm64/boot || true
 
-      - name: Empacotar com AnyKernel3
+      - name: "Empacotar com AnyKernel3"
         shell: bash
         run: |
           set -euxo pipefail
@@ -170,7 +170,7 @@ jobs:
           zip -r9 "../kernel-${ROM_TEXT:-build}.zip" . -x "*.git*"
           echo "ZIP_PATH=$GITHUB_WORKSPACE/kernel-${ROM_TEXT:-build}.zip" >> "$GITHUB_ENV"
 
-      - name: Publicar artefato
+      - name: "Publicar artefato"
         uses: actions/upload-artifact@v4
         with:
           name: kernel-${{ env.ROM_TEXT || 'build' }}
