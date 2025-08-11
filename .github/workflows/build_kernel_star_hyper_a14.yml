@@ -42,36 +42,28 @@ jobs:
           # Garante diretório e arquivo do perfil
           mkdir -p Profiles
           test -f "Profiles/${PROFILE_NAME}"
-
           echo "→ Perfil: Profiles/${PROFILE_NAME}"
 
-          # Normaliza final de linha (CRLF -> LF) para evitar keys com '\r'
+          # Normaliza final de linha (CRLF -> LF)
           sed -i 's/\r$//' "Profiles/${PROFILE_NAME}"
 
-          # Exporta somente linhas KEY=VALUE (sem espaços ao redor do '=')
+          # Exporta KEY=VALUE
           while IFS= read -r raw || [ -n "$raw" ]; do
-            # ignora vazio e comentários
             [ -z "$raw" ] && continue
             case "$raw" in \#*) continue;; esac
-
-            # aceita KEY=VALUE
             if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
               k="${raw%%=*}"; v="${raw#*=}"
-
-              # tira aspas de envoltória se houver
               v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
-
-              # remove '\r' residuais em chave/valor por segurança
               k="${k%$'\r'}"; v="${v%$'\r'}"
-
               echo "$k=$v" >> "$GITHUB_ENV"
               printf '  %s=%s\n' "$k" "$v"
             fi
           done < "Profiles/${PROFILE_NAME}"
 
-          # Guard-rails mínimos
-          test -n "${KERNEL_SOURCE:-}"   || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
-          test -n "${DEFCONFIG_NAME:-}"  || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
+          # Guard-rails
+          test -n "${KERNEL_SOURCE:-}"  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
+          test -n "${DEFCONFIG_NAME:-}" || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
+
 
 
       - name: (Opcional) Baixar LLVM/Clang do perfil
