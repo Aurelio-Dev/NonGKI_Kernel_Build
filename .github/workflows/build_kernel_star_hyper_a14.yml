@@ -99,40 +99,59 @@ jobs:
           rm -rf KernelSU drivers/KernelSU drivers/kernelsu ksu_tmp || true
           mkdir -p drivers
 
-          # Clona em tmp e descobre onde está a pasta 'KernelSU' de verdade
+          # Clona em tmp
           git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" ksu_tmp
 
-          # Se o repo tiver uma pasta 'KernelSU' interna, usamos ela; senão usamos a raiz
-          SRC_DIR="ksu_tmp"
-          if [[ -d ksu_tmp/KernelSU && -f ksu_tmp/KernelSU/Makefile ]]; then
-            SRC_DIR="ksu_tmp/KernelSU"
+          # Descobre onde está o Makefile "real" do KernelSU dentro do repo
+          CAND_DIR=""
+          for d in \
+            "ksu_tmp/KernelSU" \
+            "ksu_tmp/kernel" \
+            "ksu_tmp" ; do
+            if [[ -f "$d/Makefile" && -f "$d/Kconfig" ]]; then
+              CAND_DIR="$d"
+              break
+            fi
+          done
+
+          # Se não achou par Makefile+Kconfig, tente só Makefile e depois só Kconfig
+          if [[ -z "$CAND_DIR" ]]; then
+            if CAND_MK="$(find ksu_tmp -maxdepth 2 -type f -name Makefile | head -n1)"; then
+              CAND_DIR="$(dirname "$CAND_MK")"
+            fi
           fi
 
-          # Copia o conteúdo nivelado para drivers/KernelSU
+          # Copia o conteúdo do diretório detectado para drivers/KernelSU/
           mkdir -p drivers/KernelSU
-          cp -a "${SRC_DIR}/." drivers/KernelSU/
+          if [[ -n "${CAND_DIR}" ]]; then
+            cp -a "${CAND_DIR}/." drivers/KernelSU/
+          else
+            echo "::error::Não localizei diretório com Makefile do KernelSU dentro do repositório clonado."
+            find ksu_tmp -maxdepth 2 -type f -name 'Makefile' -o -name 'Kconfig' | sed -n '1,200p' || true
+            exit 2
+          fi
 
-          # Alguns branches têm Kconfig em kernel/Kconfig – cria alias no topo
+          # Se o Kconfig estiver em kernel/Kconfig, gera alias no topo
           if [[ ! -f drivers/KernelSU/Kconfig && -f drivers/KernelSU/kernel/Kconfig ]]; then
             cp -f drivers/KernelSU/kernel/Kconfig drivers/KernelSU/Kconfig
           fi
 
-          # Garante include e linkagem no drivers/Makefile
+          # Garante include e linkagem
           grep -q "subdir-ccflags-y.*drivers/KernelSU/include" drivers/Makefile || \
             echo 'subdir-ccflags-y += -I$(srctree)/drivers/KernelSU/include' >> drivers/Makefile
-
           grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile || \
             echo 'obj-y += KernelSU/' >> drivers/Makefile
 
-          # drivers/Kconfig deve apontar para drivers/KernelSU/Kconfig
+          # drivers/Kconfig → drivers/KernelSU/Kconfig
           sed -i 's#KernelSU/Kconfig#drivers/KernelSU/Kconfig#g; s#drivers/kernelsu/Kconfig#drivers/KernelSU/Kconfig#g' drivers/Kconfig || true
           grep -q 'drivers/KernelSU/Kconfig' drivers/Kconfig || \
             printf '\nsource "drivers/KernelSU/Kconfig"\n' >> drivers/Kconfig
 
-          echo "── Conteúdo de drivers/KernelSU (topo):"
-          ls -la drivers/KernelSU | sed -n '1,80p'
-          test -f drivers/KernelSU/Makefile && echo "OK: drivers/KernelSU/Makefile existe"
-          test -f drivers/KernelSU/Kconfig   && echo "OK: drivers/KernelSU/Kconfig existe"
+          echo "── Verificando:"
+          ls -la drivers/KernelSU | sed -n '1,120p'
+          test -f drivers/KernelSU/Makefile || { echo "::error::Faltando drivers/KernelSU/Makefile"; exit 2; }
+          test -f drivers/KernelSU/Kconfig  || { echo "::error::Faltando drivers/KernelSU/Kconfig";  exit 2; }
+
 
 
       - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
