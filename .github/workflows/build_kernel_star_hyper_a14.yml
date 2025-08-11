@@ -163,6 +163,65 @@ jobs:
             sed -i 's/\bloff_t[[:space:]]\+off;/__maybe_unused loff_t off;/' "$f"
             echo "→ Hotfix aplicado em $f"
           fi
+
+      - name: Ajustes de árvore (KernelSU/kernelsu + higiene)
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+
+          # Se houver referências incondicionais a KernelSU/kernelsu, comenta-as
+          for f in drivers/Makefile drivers/Kconfig; do
+            if [[ -f "$f" ]]; then
+              sed -i 's/^\(obj-[^=]*[[:space:]]\+KernelSU\/\)/# \1/' "$f" || true
+              sed -i 's,^\s*source\s\+\"drivers/KernelSU/Kconfig\",# &,' "$f" || true
+              sed -i 's/^\(obj-[^=]*[[:space:]]\+kernelsu\/\)/# \1/' "$f" || true
+              sed -i 's,^\s*source\s\+\"drivers/kernelsu/Kconfig\",# &,' "$f" || true
+            fi
+          done
+
+      - name: Configurar e compilar (robusto)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          # 1) Defconfig (com descoberta robusta, igual já fazemos)
+          want="${DEFCONFIG_NAME}"
+          base="${want##*/}"
+          path1="arch/arm64/configs/${want}"
+          found=""
+          if [[ -f "$path1" ]]; then
+            found="$want"
+          else
+            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
+          fi
+          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
+          echo "→ Usando defconfig: $found"
+
+          # 2) Gera defconfig + sincroniza sem interação
+          make O=out "$found" V=1 2>&1 | tee build.log
+          yes "" | make O=out olddefconfig 2>&1 | tee -a build.log
+
+          # 3) Força overrides anti-ZRAM (contorna -Werror no zram_drv.c)
+          chmod +x ./scripts/config
+          ./scripts/config --file out/.config -d CONFIG_ZRAM || true
+          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
+          yes "" | make O=out olddefconfig 2>&1 | tee -a build.log
+
+          # (opcional) confirme que ficou desabilitado
+          grep -E 'CONFIG_ZRAM|CONFIG_ZSMALLOC' out/.config || true
+
+          # 4) Build
+          set +e
+          make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 V=1 \
+               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               2>&1 | tee -a build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          exit $rc
+
+      
       - name: Compilar Kernel (defconfig + build, com log)
         shell: bash
         run: |
