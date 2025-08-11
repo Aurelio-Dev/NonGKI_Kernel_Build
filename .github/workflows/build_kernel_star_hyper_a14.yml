@@ -23,25 +23,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p Profiles
           PROFILE_PATH="Profiles/${{ github.event.inputs.PROFILE_NAME }}"
           if [[ ! -f "${PROFILE_PATH}" ]]; then
             echo "::error::Arquivo de perfil não encontrado: ${PROFILE_PATH}"
-            echo "Arquivos disponíveis em Profiles/:"
             ls -la Profiles || true
             exit 2
           fi
-
           echo "→ Usando perfil: ${PROFILE_PATH}"
           sed -i 's/\r$//' "${PROFILE_PATH}"
-
           while IFS= read -r raw || [[ -n "$raw" ]]; do
             [[ -z "$raw" ]] && continue
             [[ "$raw" =~ ^[[:space:]]*# ]] && continue
             if printf '%s' "$raw" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*=.+$'; then
-              k="${raw%%=*}"
-              v="${raw#*=}"
+              k="${raw%%=*}"; v="${raw#*=}"
               v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
               k="${k%$'\r'}"; v="${v%$'\r'}"
               export "$k=$v"
@@ -49,9 +44,8 @@ jobs:
               printf '  %s=%s\n' "$k" "$v"
             fi
           done < "${PROFILE_PATH}"
-
-          [[ -n "${KERNEL_SOURCE:-}" ]]   || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
-          [[ -n "${DEFCONFIG_NAME:-}" ]]  || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
+          [[ -n "${KERNEL_SOURCE:-}" ]]  || { echo "::error::KERNEL_SOURCE não definido no perfil"; exit 2; }
+          [[ -n "${DEFCONFIG_NAME:-}" ]] || { echo "::error::DEFCONFIG_NAME não definido no perfil"; exit 2; }
 
       - name: "(Opcional) Baixar LLVM/Clang do perfil"
         if: ${{ env.CLANG_SOURCE != '' }}
@@ -83,7 +77,6 @@ jobs:
           set -euxo pipefail
           git --version
           rm -rf kernel-src || true
-
           if [[ -n "${KERNEL_REF:-}" ]]; then
             git clone --depth 1 --branch "$KERNEL_REF" "$KERNEL_SOURCE" kernel-src
           else
@@ -94,36 +87,38 @@ jobs:
               git clone --depth 1 --branch "$default_branch" "$KERNEL_SOURCE" kernel-src
             fi
           fi
-
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: "Injetar KernelSU no tree do kernel"
+      - name: "Injetar KernelSU em drivers/kernelsu (Kconfig/Makefile)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          # Clona KernelSU para a raiz do tree (nome correto e caso exato)
-          if [[ -d KernelSU ]]; then
-            echo "KernelSU já presente."
-          else
-            git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
+          # Remove sobras antigas e garanta destino
+          rm -rf drivers/kernelsu
+          mkdir -p drivers
+
+          # Clona KernelSU diretamente no caminho esperado pelo drivers/Kconfig
+          git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" drivers/kernelsu
+
+          # Garante include e linkagem
+          if ! grep -q "subdir-ccflags-y.*drivers/kernelsu/include" drivers/Makefile 2>/dev/null || true; then
+            echo 'subdir-ccflags-y += -I$(srctree)/drivers/kernelsu/include' >> drivers/Makefile
+          fi
+          if ! grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile 2>/dev/null || true; then
+            echo 'obj-y += kernelsu/' >> drivers/Makefile
           fi
 
-          # Garante include e obj-y
-          if ! grep -q "subdir-ccflags-y.*KernelSU/include" drivers/Makefile 2>/dev/null || true; then
-            echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
+          # Normaliza o drivers/Kconfig para usar o caminho padronizado
+          if grep -q 'KernelSU/kernel/Kconfig' drivers/Kconfig 2>/dev/null; then
+            sed -i 's#KernelSU/kernel/Kconfig#drivers/kernelsu/Kconfig#g' drivers/Kconfig
           fi
-          if ! grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile 2>/dev/null || true; then
-            echo 'obj-y += KernelSU/' >> drivers/Makefile
+          if grep -q 'KernelSU/Kconfig' drivers/Kconfig 2>/dev/null; then
+            sed -i 's#KernelSU/Kconfig#drivers/kernelsu/Kconfig#g' drivers/Kconfig
           fi
-
-          # Corrige/garante a referência de Kconfig
-          if grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null; then
-            sed -i 's#drivers/kernelsu/Kconfig#KernelSU/kernel/Kconfig#g' drivers/Kconfig
-          fi
-          if ! grep -q 'KernelSU/kernel/Kconfig' drivers/Kconfig 2>/dev/null; then
-            printf '\nsource "KernelSU/kernel/Kconfig"\n' >> drivers/Kconfig
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null; then
+            printf '\nsource "drivers/kernelsu/Kconfig"\n' >> drivers/Kconfig
           fi
 
       - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
@@ -131,12 +126,11 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          # Apenas arquivos regulares de TEXTO
-          git ls-files | while read -r f; do
-            if [[ -f "$f" ]] && file "$f" | grep -q text; then
-              sed -i 's/\r$//' "$f"
-            fi
-          done
+          git ls-files -z \
+            | xargs -0 file --mime-type \
+            | grep 'text/' \
+            | cut -d: -f1 \
+            | xargs -r sed -i 's/\r$//'
 
       - name: "Hotfix: binder_gki.c include path (millet)"
         shell: bash
@@ -153,16 +147,13 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-
           export ARCH=arm64 SUBARCH=arm64 LC_ALL=C
           if [[ -n "${CLANG_DIR:-}" && -d "${CLANG_DIR}" ]]; then
             export PATH="${CLANG_DIR}/bin:${PATH}"
           fi
-
           make O=out "${DEFCONFIG_NAME}"
           make -j"$(nproc)" O=out CC=clang LD=ld.lld LLVM=1 \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
-
           ls -la out/arch/arm64/boot || true
 
       - name: "Empacotar com AnyKernel3"
@@ -172,7 +163,6 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           rm -rf AnyKernel3
           git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
-
           KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
           if [[ ! -f "$KIMG" ]]; then
             echo "::error::Kernel Image não encontrado em $KIMG"
