@@ -18,7 +18,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Lê o perfil, normaliza CRLF, exporta agora e persiste para próximos steps
       - name: "Carregar perfil"
         id: load_env
         shell: bash
@@ -90,45 +89,53 @@ jobs:
           fi
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel-src" >> "$GITHUB_ENV"
 
-      - name: "Injetar KernelSU na raiz (Kconfig/Makefile corretos)"
+      - name: "Injetar KernelSU (garante KernelSU/Kconfig)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
 
-          # Limpa tentativas antigas
-          rm -rf drivers/kernelsu || true
-
-          # Clona KernelSU na raiz (padrão oficial)
+          # Clona KernelSU na raiz (padrão)
           if [[ -d KernelSU ]]; then
             echo "KernelSU já presente."
           else
             git clone --depth 1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE}" KernelSU
           fi
 
-          # Include para headers do KernelSU
+          # Garante include e linkagem
           if ! grep -q "subdir-ccflags-y.*KernelSU/include" drivers/Makefile 2>/dev/null || true; then
             echo 'subdir-ccflags-y += -I$(srctree)/KernelSU/include' >> drivers/Makefile
           fi
-
-          # Linkagem do diretório KernelSU/
           if ! grep -qE '(^|[[:space:]])obj-y[[:space:]]*\+=[[:space:]]*KernelSU/' drivers/Makefile 2>/dev/null || true; then
             echo 'obj-y += KernelSU/' >> drivers/Makefile
           fi
 
-          # Normaliza drivers/Kconfig para o caminho correto
-          # troca quaisquer referências antigas por KernelSU/Kconfig e garante a presença
+          # Garante que exista KernelSU/Kconfig (se só existir KernelSU/kernel/Kconfig, copia)
+          if [[ ! -f KernelSU/Kconfig ]]; then
+            if [[ -f KernelSU/kernel/Kconfig ]]; then
+              cp -f KernelSU/kernel/Kconfig KernelSU/Kconfig
+              echo "→ Copiado KernelSU/kernel/Kconfig -> KernelSU/Kconfig"
+            else
+              echo "::error::Não encontrei Kconfig do KernelSU em KernelSU/Kconfig nem KernelSU/kernel/Kconfig"
+              ls -la KernelSU || true
+              exit 2
+            fi
+          fi
+
+          # drivers/Kconfig deve referenciar KernelSU/Kconfig
           sed -i 's#drivers/kernelsu/Kconfig#KernelSU/Kconfig#g; s#KernelSU/kernel/Kconfig#KernelSU/Kconfig#g' drivers/Kconfig || true
           if ! grep -q 'KernelSU/Kconfig' drivers/Kconfig 2>/dev/null; then
             printf '\nsource "KernelSU/Kconfig"\n' >> drivers/Kconfig
           fi
+
+          echo "── Conteúdo de KernelSU/:"
+          ls -la KernelSU || true
 
       - name: "Sanear Makefiles/Config (CRLF/BOM/TAB)"
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          # Versão rápida: processa apenas arquivos de TEXTO em lote
           git ls-files -z \
             | xargs -0 file --mime-type \
             | grep 'text/' \
