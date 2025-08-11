@@ -174,7 +174,7 @@ jobs:
           path1="arch/arm64/configs/${want}"
           found=""
 
-          # 1) Resolver o defconfig solicitado, com fallbacks
+          # Resolver defconfig com fallback
           if [[ -f "$path1" ]]; then
             found="$want"
           else
@@ -192,37 +192,29 @@ jobs:
           fi
 
           if [[ -z "$found" ]]; then
-            echo "::warning::Defconfig '${want}' não encontrado. Alguns candidatos:"
-            find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -n 200 || true
-            for fb in vendor/gki_defconfig gki_defconfig; do
-              if [[ -f "arch/arm64/configs/$fb" ]]; then found="$fb"; echo "→ Usando fallback: $fb"; break; fi
-            done
-          fi
-
-          if [[ -z "$found" ]]; then
-            echo "::error::Nenhum defconfig compatível encontrado (queria '${want}')."
-            exit 2
+            echo "::warning::Defconfig '${want}' não encontrado. Usando fallback gki_defconfig…"
+            found="gki_defconfig"
           fi
 
           echo "→ Defconfig selecionado: $found"
 
-          # 2) Gera defconfig
-          make O=out "$found" V=1 2>&1 | tee build.log
+          # 1) Gera defconfig (FORÇA ARM64)
+          make O=out ARCH=arm64 "$found" V=1 2>&1 | tee build.log
 
-          # 3) FORÇAR modo não-interativo para novas opções (aceitar defaults)
-          yes "" | make O=out olddefconfig    2>&1 | tee -a build.log
-          yes "" | make O=out syncconfig      2>&1 | tee -a build.log
+          # 2) Normaliza sem interação (sem usar 'yes' para não gerar Broken pipe)
+          make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
+          make O=out ARCH=arm64 syncconfig    2>&1 | tee -a build.log
 
-          # (opcional) pequenos ajustes conhecidos que geram -Werror
+          # 3) Overrides opcionais (zram/zsmalloc) e consolida
           chmod +x ./scripts/config
-          ./scripts/config --file out/.config -d CONFIG_ZRAM      || true
-          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC  || true
-          yes "" | make O=out olddefconfig    2>&1 | tee -a build.log
+          ./scripts/config --file out/.config -d CONFIG_ZRAM     || true
+          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
+          make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
 
-          # 4) Build principal — fixar host em Clang e deixar tudo LLVM
+          # 4) Build principal — LLVM + Clang, fixando host em Clang também
           set +e
           make -j"$(nproc)" \
-               O=out LLVM=1 CC=clang LD=ld.lld \
+               O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ V=1 \
                2>&1 | tee -a build.log
