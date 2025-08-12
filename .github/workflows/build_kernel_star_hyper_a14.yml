@@ -93,6 +93,7 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
           rm -rf KernelSU drivers/kernelsu drivers/KernelSU ksu_tmp || true
           mkdir -p drivers
           [[ -n "${KERNELSU_SOURCE:-}" ]] || exit 0
@@ -122,6 +123,7 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
           git ls-files -z \
             | xargs -0 file --mime-type \
             | grep 'text/' \
@@ -133,6 +135,7 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
           f="fs/erofs/inode.c"
           if [[ -f "$f" ]] && grep -qE '^[[:space:]]*loff_t[[:space:]]+off;' "$f"; then
             sed -i 's/^\([[:space:]]*\)loff_t[[:space:]]\+off;/\1__maybe_unused loff_t off;/' "$f"
@@ -144,6 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
           # limpa restos de build dentro do source (o nosso build usa O=out)
           rm -rf include/config include/generated arch/arm64/include/generated .config .config.old || true
           mkdir -p out
@@ -154,6 +158,7 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
           f="drivers/kernelsu/selinux/selinux.c"
           if [[ -f "$f" ]] && ! grep -q 'IS_ENABLED(CONFIG_SECURITY_SELINUX)' "$f"; then
             tmp="$(mktemp)"
@@ -166,54 +171,60 @@ jobs:
             echo "→ Nada a fazer (arquivo inexistente ou já guardado)"
           fi
 
-
-      - name: Disable KernelSU SELinux glue (quando SELinux do kernel está ativo)
+      - name: Disable KernelSU SELinux glue if kernel SELinux is enabled
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
           mk="drivers/kernelsu/Makefile"
-          if [ -f "$mk" ]; then
-            cp -a "$mk" "$mk.bak"
-            sed -i -E 's#^(\s*obj[^=]*\+=.*)\bselinux/(\s*)#\1\2#g' "$mk"
+          if [[ -f "$mk" ]]; then
+            # remove 'selinux/' apenas em linhas obj-... += ...
+            sed -i -E 's/^(\s*obj[^=]*\+=.*)\bselinux\/(\s*)/\1\2/g' "$mk"
+            # normaliza espaços duplos que possam ficar
             sed -i -E 's/[[:space:]]{2,}/ /g' "$mk"
-            echo "→ Verificando Makefile do KSU"
+      
+            echo "→ Verificando se ainda há selinux/ nas linhas obj-... +="
             if grep -nE '^\s*obj[^=]*\+=.*\bselinux/' "$mk"; then
-              echo "::error::Ainda está listando selinux/ em obj-... += no Makefile do KSU"; exit 3
+              echo "::error::Ainda está incluindo 'selinux/' em obj-... += no Makefile do KSU"
+              sed -n '1,200p' "$mk"
+              exit 3
             else
-              echo "→ selinux/ removido das linhas obj-... += (ok)"
+              echo "→ selinux/ REMOVIDO das linhas obj-... += (ok)."
             fi
-          else
-            echo "→ drivers/kernelsu/Makefile não encontrado; seguindo"
           fi
 
-      - name: Guard NR_ZSPAGES in taskstats.c (robusto)
+      - name: Patch taskstats (guard NR_ZSPAGES — robusto)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
           f="kernel/taskstats.c"
-          if ! grep -q 'NR_ZSPAGES' "$f"; then
-            echo "→ Nada com NR_ZSPAGES em $f"; exit 0
+          line="$(grep -n 'NR_ZSPAGES' "$f" | head -n1 | cut -d: -f1 || true)"
+          if [ -n "$line" ]; then
+            # se já houver guard imediato, não duplica
+            if sed -n "$((line-2)),$((line))p" "$f" | grep -q 'CONFIG_ZSMALLOC'; then
+              echo "→ Já protegido, nada a fazer"
+              exit 0
+            fi
+            head -n $((line-1)) "$f" > "$f.new"
+            echo '#if defined(CONFIG_ZSMALLOC)' >> "$f.new"
+            sed -n "${line}p" "$f" >> "$f.new"
+            echo '#endif /* CONFIG_ZSMALLOC */' >> "$f.new"
+            tail -n +$((line+1)) "$f" >> "$f.new"
+            mv "$f.new" "$f"
+            echo "→ Guard inserido em $f (linha $line)"
+          else
+            echo "→ NR_ZSPAGES não encontrado em $f; nada a fazer"
           fi
-          awk '
-            /NR_ZSPAGES/ && !done {
-              print "#if defined(CONFIG_ZSMALLOC)";
-              print $0;
-              print "#endif /* CONFIG_ZSMALLOC */";
-              done=1; next
-            }
-            { print }
-          ' "$f" > "$f.new"
-          mv "$f.new" "$f"
-          echo "→ Guard aplicado em $f"
-
 
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
       
           # 1) Resolver defconfig
           want="${DEFCONFIG_NAME}"
@@ -230,40 +241,25 @@ jobs:
           echo "→ Usando defconfig: $found"
       
           # 2) Gerar .config
-          make O=out ARCH=arm64 "$found" V=1        2>&1 | tee  build.log
-          make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
-          make O=out ARCH=arm64 syncconfig          2>&1 | tee -a build.log
+          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
+          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
+          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
       
           # 3) (Opcional) overrides – sem 'yes'
           chmod +x ./scripts/config
           ./scripts/config --file out/.config -e CONFIG_ZRAM      || true
           ./scripts/config --file out/.config -e CONFIG_ZSMALLOC  || true
-          make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
-
+          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig  2>&1 | tee -a build.log
           # 🔎 Check final .config (apenas log – não falha o job)
           echo "→ Checando ZSMALLOC/ZRAM no .config"
-          if [ -f out/.config ]; then
-            grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
-            if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
-              echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
-            fi
-          else
-            echo "→ .config ainda não existe nesta altura; seguindo"
+          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
+          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
+            echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
           fi
+          yes "" | make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld oldconfig 2>&1 | tee -a build.log
 
-          #  Check final .config (apenas log – não falha o job)
-          echo "→ Checando ZSMALLOC/ZRAM no .config"
-          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
-          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
-            echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
-          fi
-          
-          # Check final .config (apenas log – não falha o job)
-          echo "→ Checando ZSMALLOC/ZRAM no .config"
-          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
-          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
-            echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
-          fi
+
+
           # 4) Build
           set +e
           make -j"$(nproc)" \
@@ -282,6 +278,7 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
           echo "=== HEAD do log (200 linhas) ==="; head -n 200 build.log || true
           echo "=== TAIL do log (200 linhas) ==="; tail -n 200 build.log || true
           echo "=== Erros encontrados (contexto ±3) ==="
