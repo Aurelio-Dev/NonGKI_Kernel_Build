@@ -251,10 +251,16 @@ jobs:
       
           # 3) (Opcional) overrides – sem 'yes'
           chmod +x ./scripts/config
-          ./scripts/config --file out/.config -d CONFIG_ZRAM     || true
-          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
-          make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
-      
+          ./scripts/config --file out/.config -e CONFIG_ZRAM      || true
+          ./scripts/config --file out/.config -e CONFIG_ZSMALLOC  || true
+          make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
+          
+          # Check final .config (apenas log – não falha o job)
+          echo "→ Checando ZSMALLOC/ZRAM no .config"
+          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
+          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
+            echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
+          fi
           # 4) Build
           set +e
           make -j"$(nproc)" \
