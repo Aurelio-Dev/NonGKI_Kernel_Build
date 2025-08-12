@@ -188,24 +188,31 @@ jobs:
           set -euxo pipefail
           cd "$KERNEL_DIR"
           f="kernel/taskstats.c"
-          # Sai se já houver um #ifdef imediato antes da chamada
-          if grep -n 'NR_ZSPAGES' "$f" | head -n1 | cut -d: -f1 | xargs -I{} sed -n '{}-2,{}p' "$f" | grep -q 'CONFIG_ZSMALLOC'; then
-            echo "→ Já protegido, nada a fazer"
-            exit 0
+          # Se a PRIMEIRA ocorrência ainda não está guardada, guardamos agora
+          line="$(grep -n 'NR_ZSPAGES' "$f" | head -n1 | cut -d: -f1 || true)"
+          if [ -n "$line" ]; then
+            head -n $((line-1)) "$f" > "$f.new"
+            echo '#if defined(CONFIG_ZSMALLOC)' >> "$f.new"
+            sed -n "${line}p" "$f" >> "$f.new"
+            echo '#endif /* CONFIG_ZSMALLOC */' >> "$f.new"
+            tail -n +$((line+1)) "$f" >> "$f.new"
+            mv "$f.new" "$f"
+            echo "→ Guard inserido em $f (linha $line)"
+          else
+            echo "→ NR_ZSPAGES não encontrado em $f; nada a fazer"
           fi
-          awk '{
-            if (!patched && $0 ~ /NR_ZSPAGES/) {
-              print "#if defined(CONFIG_ZSMALLOC)"
-              print
-              print "#endif /* CONFIG_ZSMALLOC */"
-              patched=1
-              next
-            }
-            print
-          }' "$f" > "$f.new"
-          mv "$f.new" "$f"
-          echo "→ Guard inserido em $f"
 
+      - name: Assert ZSMALLOC is enabled (debug)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          echo "→ Checando .config"
+          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
+          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
+            echo "::error::CONFIG_ZSMALLOC NÃO está =y depois dos overrides; Kconfig reverteu."
+            exit 3
+          fi
 
       - name: Configurar e compilar (robusto)
         shell: bash
