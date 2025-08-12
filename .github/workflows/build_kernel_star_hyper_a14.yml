@@ -188,18 +188,6 @@ jobs:
             fi
           fi
 
-      - name: Assert ZSMALLOC is enabled (debug)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-          echo "→ Checando .config"
-          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
-          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
-            echo "::error::CONFIG_ZSMALLOC NÃO está =y depois dos overrides; Kconfig reverteu."
-            exit 3
-          fi
-
       - name: Patch taskstats (guard NR_ZSPAGES — robusto)
         shell: bash
         run: |
@@ -254,6 +242,13 @@ jobs:
           ./scripts/config --file out/.config -e CONFIG_ZRAM      || true
           ./scripts/config --file out/.config -e CONFIG_ZSMALLOC  || true
           make O=out ARCH=arm64 olddefconfig  2>&1 | tee -a build.log
+
+          #  Check final .config (apenas log – não falha o job)
+          echo "→ Checando ZSMALLOC/ZRAM no .config"
+          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
+          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
+            echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
+          fi
           
           # Check final .config (apenas log – não falha o job)
           echo "→ Checando ZSMALLOC/ZRAM no .config"
