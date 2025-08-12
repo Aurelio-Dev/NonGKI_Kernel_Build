@@ -171,28 +171,28 @@ jobs:
             echo "→ Nada a fazer (arquivo inexistente ou já guardado)"
           fi
 
-      - name: Disable KernelSU SELinux glue if kernel SELinux is enabled
+      - name: Disable KernelSU SELinux glue (robusto)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          export KCONFIG_CONFIG=out/.config
+      
           mk="drivers/kernelsu/Makefile"
           if [[ -f "$mk" ]]; then
-            # remove 'selinux/' apenas em linhas obj-... += ...
-            sed -i -E 's/^(\s*obj[^=]*\+=.*)\bselinux\/(\s*)/\1\2/g' "$mk"
-            # normaliza espaços duplos que possam ficar
+            # remove referências a 'selinux' em obj-* e subdir-*
+            sed -i -E 's/^(\s*(obj|subdir)[^=]*\+=[^#]*)(\bselinux(\/[[:alnum:]._-]+)?)([[:space:]]*)/\1 \5/g' "$mk"
+            # compacta espaços duplicados
             sed -i -E 's/[[:space:]]{2,}/ /g' "$mk"
-      
-            echo "→ Verificando se ainda há selinux/ nas linhas obj-... +="
-            if grep -nE '^\s*obj[^=]*\+=.*\bselinux/' "$mk"; then
-              echo "::error::Ainda está incluindo 'selinux/' em obj-... += no Makefile do KSU"
-              sed -n '1,200p' "$mk"
-              exit 3
-            else
-              echo "→ selinux/ REMOVIDO das linhas obj-... += (ok)."
-            fi
           fi
+      
+          # sanity check: nenhum Makefile do KSU deve referenciar selinux após o patch
+          if grep -RInE '^\s*(obj|subdir)[^=]*\+=.*\bselinux(\/|[[:space:]])' drivers/kernelsu 2>/dev/null; then
+            echo "::error::Ainda restam referências a selinux/ em drivers/kernelsu/*Makefile"
+            grep -RInE '^\s*(obj|subdir)[^=]*\+=.*\bselinux(\/|[[:space:]])' drivers/kernelsu || true
+            exit 3
+          fi
+      
+          echo "→ Glue de SELinux do KernelSU desativado (subdir/obj)."
 
       - name: Patch taskstats (guard NR_ZSPAGES — robusto)
         shell: bash
