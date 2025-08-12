@@ -182,23 +182,30 @@ jobs:
             fi
           fi
 
-      - name: Patch taskstats (guard NR_ZSPAGES)
+      - name: Patch taskstats (guard NR_ZSPAGES — robusto)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
           f="kernel/taskstats.c"
-          # só aplica se a linha existir e ainda não estiver guardada
-          if grep -q 'NR_ZSPAGES' "$f" && ! grep -q 'CONFIG_ZSMALLOC' "$f"; then
-            awk '{
-              if ($0 ~ /NR_ZSPAGES/ && !printed) { print "#ifdef CONFIG_ZSMALLOC"; print; printed=1; next }
-              print
-            } END { if (printed) print "#endif /* CONFIG_ZSMALLOC */" }' "$f" > "$f.new"
-            mv "$f.new" "$f"
-            echo "→ Guard inserido em $f"
-          else
-            echo "→ Nada a fazer em $f"
+          # Sai se já houver um #ifdef imediato antes da chamada
+          if grep -n 'NR_ZSPAGES' "$f" | head -n1 | cut -d: -f1 | xargs -I{} sed -n '{}-2,{}p' "$f" | grep -q 'CONFIG_ZSMALLOC'; then
+            echo "→ Já protegido, nada a fazer"
+            exit 0
           fi
+          awk '{
+            if (!patched && $0 ~ /NR_ZSPAGES/) {
+              print "#if defined(CONFIG_ZSMALLOC)"
+              print
+              print "#endif /* CONFIG_ZSMALLOC */"
+              patched=1
+              next
+            }
+            print
+          }' "$f" > "$f.new"
+          mv "$f.new" "$f"
+          echo "→ Guard inserido em $f"
+
 
       - name: Configurar e compilar (robusto)
         shell: bash
