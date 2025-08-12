@@ -173,13 +173,19 @@ jobs:
           cd "$KERNEL_DIR"
           mk="drivers/kernelsu/Makefile"
           if [[ -f "$mk" ]]; then
-            if grep -q 'selinux/' "$mk"; then
-              sed -i -E 's|(obj[^=]*\+=.*)selinux/ ?|\1|g' "$mk"
-              echo "→ Removido selinux/ de $mk (KernelSU)"
+            # remove 'selinux/' apenas em linhas obj-... += ...
+            sed -i -E 's/^(\s*obj[^=]*\+=.*)\bselinux\/(\s*)/\1\2/g' "$mk"
+            # normaliza espaços duplos que possam ficar
+            sed -i -E 's/[[:space:]]{2,}/ /g' "$mk"
+      
+            echo "→ Verificando se ainda há selinux/ nas linhas obj-... +="
+            if grep -nE '^\s*obj[^=]*\+=.*\bselinux/' "$mk"; then
+              echo "::error::Ainda está incluindo 'selinux/' em obj-... += no Makefile do KSU"
+              sed -n '1,200p' "$mk"
+              exit 3
             else
-              echo "→ selinux/ já não está sendo incluído"
+              echo "→ selinux/ REMOVIDO das linhas obj-... += (ok)."
             fi
-            grep -n 'selinux/' "$mk" && { echo "::error::Ainda há selinux/ no Makefile do KSU"; exit 3; } || true
           fi
 
       - name: Assert ZSMALLOC is enabled (debug)
