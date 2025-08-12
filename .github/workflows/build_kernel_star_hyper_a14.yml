@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       PROFILE_NAME:
-        description: "Nome do arquivo de perfil em Profiles/ (ex.: star_hyper_a14.env)"
+        description: "star_hyper_a14.env)"
         required: true
         default: "star_hyper_a14.env"
 
@@ -188,7 +188,7 @@ jobs:
       
           # 2) Gerar .config
                     rm -rf out
-make O=out ARCH=arm64 "$found" V=1        2>&1 | tee  build.log
+          make O=out ARCH=arm64 "$found" V=1        2>&1 | tee  build.log
           make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
           make O=out ARCH=arm64 syncconfig          2>&1 | tee -a build.log
       
