@@ -256,10 +256,7 @@ jobs:
           if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
             echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
           fi
-          yes "" | make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld oldconfig 2>&1 | tee -a build.log
-
-
-
+ 
           # 4) Build
           set +e
           make -j"$(nproc)" \
