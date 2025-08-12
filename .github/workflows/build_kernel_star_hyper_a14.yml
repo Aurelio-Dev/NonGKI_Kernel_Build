@@ -148,6 +148,42 @@ jobs:
           rm -rf include/config include/generated arch/arm64/include/generated .config .config.old || true
           mkdir -p out
 
+      - name: Apply compatibility patches (KSU + SELinux / NR_ZSPAGES)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+      
+          # 1) Evitar redefinição de current_sid do KernelSU quando SELinux estiver ativo
+          cat > ksuselinux.patch <<'PATCH'
+          --- a/drivers/kernelsu/selinux/selinux.c
+          +++ b/drivers/kernelsu/selinux/selinux.c
+          @@
+          +#include <linux/security.h>
+          +#include <linux/cred.h>
+          +#include <linux/lsm_hooks.h>
+          +#if !IS_ENABLED(CONFIG_SECURITY_SELINUX)
+           static inline u32 current_sid(void)
+           {
+               /* ... corpo original ... */
+           }
+          +#endif
+          PATCH
+              git apply --whitespace=fix ksuselinux.patch || true
+          
+              # 2) Proteger NR_ZSPAGES quando ZSMALLOC não estiver presente
+              cat > taskstats.patch <<'PATCH'
+          --- a/kernel/taskstats.c
+          +++ b/kernel/taskstats.c
+          @@
+          -       zspages += zone_page_state(zone, NR_ZSPAGES);
+          + #ifdef CONFIG_ZSMALLOC
+          +       zspages += zone_page_state(zone, NR_ZSPAGES);
+          + #endif
+          PATCH
+              git apply --whitespace=fix taskstats.patch || true
+
+
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
