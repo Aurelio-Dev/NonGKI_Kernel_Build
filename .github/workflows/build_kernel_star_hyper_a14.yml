@@ -4,23 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       DEFCONFIG_NAME:
-        description: "Defconfig (ex.: vendor/gki_defconfig ou vendor/star_hyper_a14_defconfig)"
+        description: "Defconfig desejado (ex.: vendor/star_hyper_a14_defconfig)"
         required: true
-        default: "vendor/gki_defconfig"
+        default: "vendor/star_hyper_a14_defconfig"
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     env:
       KERNEL_DIR: ${{ github.workspace }}/kernel-src
       DEFCONFIG_NAME: ${{ github.event.inputs.DEFCONFIG_NAME }}
 
     steps:
+      # ───────────────────────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
+      # (Opcional) Se você clona o kernel de outro repositório, faça aqui
+      # - name: Clonar fonte do Kernel
+      #   run: |
+      #     set -euxo pipefail
+      #     rm -rf "$KERNEL_DIR"
+      #     git clone --depth=1 https://seu.repo/kernel.git "$KERNEL_DIR"
+
+      # ───────────────────────────────────────────────────────────────────────
       - name: Dependências
         run: |
           set -euxo pipefail
@@ -30,120 +38,114 @@ jobs:
             git gperf libncurses-dev libssl-dev python3 unzip xz-utils \
             clang lld llvm
 
-      # Se o source já está no repo, só garanta a pasta out
+      # ───────────────────────────────────────────────────────────────────────
       - name: Preparar árvore de build
         run: |
           set -euxo pipefail
           mkdir -p "$KERNEL_DIR/out"
-
-      # Higiene para evitar CONFIG “sujo”
-      - name: Limpeza de vestígios de build no source
-        run: |
-          set -euxo pipefail
+          # Limpa vestígios de configs antigos no source tree
           cd "$KERNEL_DIR"
-          rm -rf include/config include/generated arch/arm64/include/generated \
-                 .config .config.old out/.config out/include out/arch/arm64/include/generated || true
-          mkdir -p out
+          rm -rf include/config include/generated \
+                 arch/arm64/include/generated .config .config.old || true
 
+      # ───────────────────────────────────────────────────────────────────────
+      # NOVO: resolve um defconfig que REALMENTE exista
       - name: Resolver defconfig (robusto)
-        id: pick_defconfig
+        id: defcfg
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
-          want="${DEFCONFIG_NAME}"
-          base="${want##*/}"
+
+          want="${DEFCONFIG_NAME:-}"
           found=""
+          archdir="arch/arm64/configs"
 
-          # 1) Caminho exato sob arch/arm64/configs
-          if [[ -f "arch/arm64/configs/${want}" ]]; then
+          # 1) exatamente o pedido
+          if [[ -n "$want" && -f "$archdir/$want" ]]; then
             found="$want"
-          else
-            # 2) procurar por nome
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
           fi
 
-          # 3) fallback para gki_defconfig
+          # 2) mesmo basename em qualquer subpasta
+          if [[ -z "$found" && -n "$want" ]]; then
+            base="${want##*/}"
+            cand="$(ls "$archdir"/**/"$base" 2>/dev/null | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#${archdir}/}"
+          fi
+
+          # 3) algum vendor/*_defconfig
           if [[ -z "$found" ]]; then
-            echo "::warning::Defconfig '${want}' não encontrado. Usando fallback gki_defconfig."
-            found="gki_defconfig"
+            cand="$(ls "$archdir"/vendor/*_defconfig 2>/dev/null | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#${archdir}/}"
           fi
 
-          echo "FOUND_DEFCONFIG=$found" >> "$GITHUB_OUTPUT"
-          echo "→ Defconfig: $found"
+          # 4) qualquer *_defconfig
+          if [[ -z "$found" ]]; then
+            cand="$(ls "$archdir"/*_defconfig 2>/dev/null | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#${archdir}/}"
+          fi
 
+          if [[ -z "$found" ]]; then
+            echo "::error::Nenhum defconfig encontrado. Conteúdo de $archdir (amostra):"
+            find "$archdir" -maxdepth 2 -name "*defconfig" | sed 's#^#  - #'
+            exit 2
+          fi
+
+          echo "→ Defconfig resolvido: $found"
+          echo "DEFCONFIG_RESOLVED=$found" >> "$GITHUB_ENV"
+
+      # ───────────────────────────────────────────────────────────────────────
+      # NOVO: gera .config SEM prompts (sem 'yes', sem Broken pipe)
       - name: Gerar .config (não-interativo)
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-
-          # defconfig
-          make O=out ARCH=arm64 "${{ steps.pick_defconfig.outputs.FOUND_DEFCONFIG }}" V=1
-
-          # aceitar padrões para novas opções
-          yes "" | make O=out ARCH=arm64 olddefconfig
-
-          # pequenos overrides que vinham causando -Werror em alguns trees
-          chmod +x ./scripts/config || true
-          ./scripts/config --file out/.config -d CONFIG_ZRAM || true
-          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
-          yes "" | make O=out ARCH=arm64 olddefconfig
-
-      # ⚠️ PONTO-CHAVE: desliga Werror e neutraliza flags problemáticas
-      - name: Desativar Werror globalmente (DRM/Clang)
-        id: wnoerror
         shell: bash
         run: |
-          set -euxo pipefail
-          # Lista ampla o suficiente para neutralizar os -Werror=* mais comuns deste tree
-          WNOERR="-Wno-error -Wno-error=return-type -Wno-error=implicit-int -Wno-error=implicit-function-declaration \
-                  -Wno-error=incompatible-pointer-types -Wno-error=address-of-packed-member \
-                  -Wno-error=unused-function -Wno-error=unused-variable -Wno-error=unused-but-set-variable \
-                  -Wno-error=misleading-indentation -Wno-error=maybe-uninitialized -Wno-error=shift-negative-value \
-                  -Wno-error=int-conversion -Wno-error=ignored-attributes"
-          {
-            echo "KCFLAGS=$WNOERR"
-            echo "KBUILD_CFLAGS=$WNOERR"
-            echo "KBUILD_CPPFLAGS=$WNOERR"
-            echo "HOSTCFLAGS=$WNOERR"
-            echo "WERROR=0"
-            # Usaremos também LLVM IAS para reduzir ruído de binutils
-            echo "LLVM=1"
-            echo "LLVM_IAS=1"
-          } >> "$GITHUB_ENV"
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          : "${DEFCONFIG_RESOLVED:?DEFCONFIG_RESOLVED não definido}"
 
+          echo "→ Usando defconfig: ${DEFCONFIG_RESOLVED}"
+          make O=out ARCH=arm64 "${DEFCONFIG_RESOLVED}" V=1
+
+          # Consolida opções novas com padrão, sem interatividade
+          make O=out ARCH=arm64 olddefconfig
+
+      # ───────────────────────────────────────────────────────────────────────
+      # COMPILAÇÃO (ajuste os flags conforme sua árvore)
       - name: Compilar Kernel (robusto, sem prompts)
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           cd "$KERNEL_DIR"
 
-          # Build principal; as flags anti-Werror vêm do GITHUB_ENV
-          # Repetimos os tools para garantir Clang/LLD em host e target.
           set +e
           make -j"$(nproc)" \
-               O=out ARCH=arm64 V=1 \
-               CC=clang LD=ld.lld HOSTCC=clang HOSTCXX=clang++ \
-               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
+               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+               OBJDUMP=llvm-objdump STRIP=llvm-strip V=1 \
                2>&1 | tee build.log
           rc=${PIPESTATUS[0]}
           set -e
-          exit $rc
 
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::Falha na compilação. Veja build.log"
+            exit $rc
+          fi
+
+          ls -la out/arch/arm64/boot || true
+
+      # ───────────────────────────────────────────────────────────────────────
       - name: Diagnóstico de falha (se houver)
         if: failure()
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          echo "=== HEAD do log (200) ==="; head -n 200 build.log || true
-          echo "=== TAIL do log (200) ==="; tail -n 200 build.log || true
-          echo "=== Erros (±3 linhas) ==="
-          grep -nEi -C3 '(^| )error:|fatal error:|undefined reference|No rule to make target|No such file or directory' build.log || true
-          echo "=== .config (início) ==="
+          echo "=== HEAD do log (200) ===" ; head -n 200 build.log || true
+          echo "=== TAIL do log (200) ===" ; tail -n 200 build.log || true
+          echo "=== .config (primeiras 160 linhas) ==="
           test -f out/.config && sed -n '1,160p' out/.config || true
 
+      # ───────────────────────────────────────────────────────────────────────
       - name: Upload de logs e .config
         if: always()
         uses: actions/upload-artifact@v4
