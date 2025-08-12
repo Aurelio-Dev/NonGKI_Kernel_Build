@@ -3,6 +3,14 @@ name: Build Kernel • star_hyper_a14
 on:
   workflow_dispatch:
     inputs:
+      KERNEL_SOURCE:
+        description: "URL do repositório do kernel (git clone)"
+        required: true
+        default: "https://github.com/seu-usuario/seu-kernel.git"
+      KERNEL_REF:
+        description: "Branch/Tag/Commit do kernel (opcional)"
+        required: false
+        default: ""
       DEFCONFIG_NAME:
         description: "Defconfig desejado (ex.: vendor/star_hyper_a14_defconfig)"
         required: true
@@ -15,20 +23,15 @@ jobs:
     env:
       KERNEL_DIR: ${{ github.workspace }}/kernel-src
       DEFCONFIG_NAME: ${{ github.event.inputs.DEFCONFIG_NAME }}
+      KERNEL_SOURCE: ${{ github.event.inputs.KERNEL_SOURCE }}
+      KERNEL_REF: ${{ github.event.inputs.KERNEL_REF }}
 
     steps:
-      # ───────────────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # (Opcional) Se você clona o kernel de outro repositório, faça aqui
-      # - name: Clonar fonte do Kernel
-      #   run: |
-      #     set -euxo pipefail
-      #     rm -rf "$KERNEL_DIR"
-      #     git clone --depth=1 https://seu.repo/kernel.git "$KERNEL_DIR"
-
-      # ───────────────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────────────────────────
       - name: Dependências
         run: |
           set -euxo pipefail
@@ -38,18 +41,43 @@ jobs:
             git gperf libncurses-dev libssl-dev python3 unzip xz-utils \
             clang lld llvm
 
-      # ───────────────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────────────────────────
+      # NOVO: clonar a árvore do kernel e validar 'arch/arm64/configs'
+      - name: Clonar kernel (robusto)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf "$KERNEL_DIR"
+          if [[ -n "${KERNEL_REF}" ]]; then
+            echo "→ Clonando ${KERNEL_SOURCE} na ref ${KERNEL_REF}"
+            git clone --depth 1 --branch "${KERNEL_REF}" "${KERNEL_SOURCE}" "$KERNEL_DIR"
+          else
+            echo "→ Detectando branch padrão de ${KERNEL_SOURCE}"
+            default_branch="$(git ls-remote --symref "${KERNEL_SOURCE}" HEAD | awk '/^ref:/ {print $2}' | sed 's#refs/heads/##')"
+            echo "→ Usando branch padrão: ${default_branch}"
+            git clone --depth 1 --branch "${default_branch}" "${KERNEL_SOURCE}" "$KERNEL_DIR"
+          fi
+
+          # Sanidade: a árvore precisa ser arm64 e ter os defconfigs
+          test -d "$KERNEL_DIR/arch/arm64/configs" || {
+            echo "::error::A árvore clonada não contém 'arch/arm64/configs'. Verifique KERNEL_SOURCE/KERNEL_REF."
+            echo "Conteúdo do topo da árvore:"
+            ls -la "$KERNEL_DIR" | sed 's#^#  #'
+            exit 2
+          }
+
+      # ────────────────────────────────────────────────────────────────────
       - name: Preparar árvore de build
         run: |
           set -euxo pipefail
           mkdir -p "$KERNEL_DIR/out"
-          # Limpa vestígios de configs antigos no source tree
           cd "$KERNEL_DIR"
+          # Limpa vestígios de configs antigos no source tree
           rm -rf include/config include/generated \
                  arch/arm64/include/generated .config .config.old || true
 
-      # ───────────────────────────────────────────────────────────────────────
-      # NOVO: resolve um defconfig que REALMENTE exista
+      # ────────────────────────────────────────────────────────────────────
       - name: Resolver defconfig (robusto)
         id: defcfg
         shell: bash
@@ -86,7 +114,7 @@ jobs:
           fi
 
           if [[ -z "$found" ]]; then
-            echo "::error::Nenhum defconfig encontrado. Conteúdo de $archdir (amostra):"
+            echo "::error::Nenhum defconfig encontrado. Amostra:"
             find "$archdir" -maxdepth 2 -name "*defconfig" | sed 's#^#  - #'
             exit 2
           fi
@@ -94,8 +122,7 @@ jobs:
           echo "→ Defconfig resolvido: $found"
           echo "DEFCONFIG_RESOLVED=$found" >> "$GITHUB_ENV"
 
-      # ───────────────────────────────────────────────────────────────────────
-      # NOVO: gera .config SEM prompts (sem 'yes', sem Broken pipe)
+      # ────────────────────────────────────────────────────────────────────
       - name: Gerar .config (não-interativo)
         shell: bash
         run: |
@@ -109,8 +136,7 @@ jobs:
           # Consolida opções novas com padrão, sem interatividade
           make O=out ARCH=arm64 olddefconfig
 
-      # ───────────────────────────────────────────────────────────────────────
-      # COMPILAÇÃO (ajuste os flags conforme sua árvore)
+      # ────────────────────────────────────────────────────────────────────
       - name: Compilar Kernel (robusto, sem prompts)
         shell: bash
         run: |
@@ -133,7 +159,7 @@ jobs:
 
           ls -la out/arch/arm64/boot || true
 
-      # ───────────────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────────────────────────
       - name: Diagnóstico de falha (se houver)
         if: failure()
         shell: bash
@@ -145,7 +171,7 @@ jobs:
           echo "=== .config (primeiras 160 linhas) ==="
           test -f out/.config && sed -n '1,160p' out/.config || true
 
-      # ───────────────────────────────────────────────────────────────────────
+      # ────────────────────────────────────────────────────────────────────
       - name: Upload de logs e .config
         if: always()
         uses: actions/upload-artifact@v4
