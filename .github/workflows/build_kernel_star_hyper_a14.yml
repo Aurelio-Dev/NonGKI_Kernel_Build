@@ -148,41 +148,23 @@ jobs:
           rm -rf include/config include/generated arch/arm64/include/generated .config .config.old || true
           mkdir -p out
 
-      - name: Apply compatibility patches (KSU + SELinux / NR_ZSPAGES)
+
+      - name: Patch KernelSU vs SELinux (wrap file, idempotente)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-      
-          # 1) Evitar redefinição de current_sid do KernelSU quando SELinux estiver ativo
-          cat > ksuselinux.patch <<'PATCH'
-          --- a/drivers/kernelsu/selinux/selinux.c
-          +++ b/drivers/kernelsu/selinux/selinux.c
-          @@
-          +#include <linux/security.h>
-          +#include <linux/cred.h>
-          +#include <linux/lsm_hooks.h>
-          +#if !IS_ENABLED(CONFIG_SECURITY_SELINUX)
-           static inline u32 current_sid(void)
-           {
-               /* ... corpo original ... */
-           }
-          +#endif
-          PATCH
-              git apply --whitespace=fix ksuselinux.patch || true
-          
-              # 2) Proteger NR_ZSPAGES quando ZSMALLOC não estiver presente
-              cat > taskstats.patch <<'PATCH'
-          --- a/kernel/taskstats.c
-          +++ b/kernel/taskstats.c
-          @@
-          -       zspages += zone_page_state(zone, NR_ZSPAGES);
-          + #ifdef CONFIG_ZSMALLOC
-          +       zspages += zone_page_state(zone, NR_ZSPAGES);
-          + #endif
-          PATCH
-              git apply --whitespace=fix taskstats.patch || true
-
+          f="drivers/kernelsu/selinux/selinux.c"
+          if [[ -f "$f" ]] && ! grep -q 'IS_ENABLED(CONFIG_SECURITY_SELINUX)' "$f"; then
+            tmp="$(mktemp)"
+            printf '#if !IS_ENABLED(CONFIG_SECURITY_SELINUX)\n' > "$tmp"
+            cat "$f" >> "$tmp"
+            printf '\n#endif /* !CONFIG_SECURITY_SELINUX */\n' >> "$tmp"
+            mv -f "$tmp" "$f"
+            echo "→ Guard inserido em $f"
+          else
+            echo "→ Nada a fazer (arquivo inexistente ou já guardado)"
+          fi
 
       - name: Configurar e compilar (robusto)
         shell: bash
@@ -205,8 +187,8 @@ jobs:
           echo "→ Usando defconfig: $found"
       
           # 2) Gerar .config
-          rm -rf out
-          make O=out ARCH=arm64 "$found" V=1        2>&1 | tee  build.log
+                    rm -rf out
+make O=out ARCH=arm64 "$found" V=1        2>&1 | tee  build.log
           make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
           make O=out ARCH=arm64 syncconfig          2>&1 | tee -a build.log
       
