@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       PROFILE_NAME:
-        description: "star_hyper_a14.env)"
+        description: "Nome do arquivo de perfil em Profiles/ (ex.: star_hyper_a14.env)"
         required: true
         default: "star_hyper_a14.env"
 
@@ -173,33 +173,13 @@ jobs:
           cd "$KERNEL_DIR"
           mk="drivers/kernelsu/Makefile"
           if [[ -f "$mk" ]]; then
-            # idempotente: remove 'selinux/' de qualquer linha obj-... += ...
             if grep -q 'selinux/' "$mk"; then
               sed -i -E 's|(obj[^=]*\+=.*)selinux/ ?|\1|g' "$mk"
               echo "→ Removido selinux/ de $mk (KernelSU)"
             else
               echo "→ selinux/ já não está sendo incluído"
             fi
-          fi
-
-      - name: Patch taskstats (guard NR_ZSPAGES — robusto)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-          f="kernel/taskstats.c"
-          # Se a PRIMEIRA ocorrência ainda não está guardada, guardamos agora
-          line="$(grep -n 'NR_ZSPAGES' "$f" | head -n1 | cut -d: -f1 || true)"
-          if [ -n "$line" ]; then
-            head -n $((line-1)) "$f" > "$f.new"
-            echo '#if defined(CONFIG_ZSMALLOC)' >> "$f.new"
-            sed -n "${line}p" "$f" >> "$f.new"
-            echo '#endif /* CONFIG_ZSMALLOC */' >> "$f.new"
-            tail -n +$((line+1)) "$f" >> "$f.new"
-            mv "$f.new" "$f"
-            echo "→ Guard inserido em $f (linha $line)"
-          else
-            echo "→ NR_ZSPAGES não encontrado em $f; nada a fazer"
+            grep -n 'selinux/' "$mk" && { echo "::error::Ainda há selinux/ no Makefile do KSU"; exit 3; } || true
           fi
 
       - name: Assert ZSMALLOC is enabled (debug)
@@ -212,6 +192,30 @@ jobs:
           if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
             echo "::error::CONFIG_ZSMALLOC NÃO está =y depois dos overrides; Kconfig reverteu."
             exit 3
+          fi
+
+      - name: Patch taskstats (guard NR_ZSPAGES — robusto)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          f="kernel/taskstats.c"
+          line="$(grep -n 'NR_ZSPAGES' "$f" | head -n1 | cut -d: -f1 || true)"
+          if [ -n "$line" ]; then
+            # se já houver guard imediato, não duplica
+            if sed -n "$((line-2)),$((line))p" "$f" | grep -q 'CONFIG_ZSMALLOC'; then
+              echo "→ Já protegido, nada a fazer"
+              exit 0
+            fi
+            head -n $((line-1)) "$f" > "$f.new"
+            echo '#if defined(CONFIG_ZSMALLOC)' >> "$f.new"
+            sed -n "${line}p" "$f" >> "$f.new"
+            echo '#endif /* CONFIG_ZSMALLOC */' >> "$f.new"
+            tail -n +$((line+1)) "$f" >> "$f.new"
+            mv "$f.new" "$f"
+            echo "→ Guard inserido em $f (linha $line)"
+          else
+            echo "→ NR_ZSPAGES não encontrado em $f; nada a fazer"
           fi
 
       - name: Configurar e compilar (robusto)
@@ -235,15 +239,14 @@ jobs:
           echo "→ Usando defconfig: $found"
       
           # 2) Gerar .config
-                    rm -rf out
           make O=out ARCH=arm64 "$found" V=1        2>&1 | tee  build.log
           make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
           make O=out ARCH=arm64 syncconfig          2>&1 | tee -a build.log
       
           # 3) (Opcional) overrides – sem 'yes'
           chmod +x ./scripts/config
-          ./scripts/config --file out/.config -e CONFIG_ZRAM     || true
-          ./scripts/config --file out/.config -e CONFIG_ZSMALLOC || true
+          ./scripts/config --file out/.config -d CONFIG_ZRAM     || true
+          ./scripts/config --file out/.config -d CONFIG_ZSMALLOC || true
           make O=out ARCH=arm64 olddefconfig        2>&1 | tee -a build.log
       
           # 4) Build
