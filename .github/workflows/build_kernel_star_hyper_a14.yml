@@ -219,6 +219,25 @@ jobs:
             echo "→ NR_ZSPAGES não encontrado em $f; nada a fazer"
           fi
 
+      - name: Guard NR_ZSPAGES em taskstats.c (idempotente)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+      
+          f="kernel/taskstats.c"
+          # Só mexe se a linha existir e ainda não estiver guardada por CONFIG_ZSMALLOC
+          if grep -q 'zone_page_state *([^,]*, *NR_ZSPAGES)' "$f"; then
+            if ! awk 'found && /#endif/ {exit} /NR_ZSPAGES/ && /zone_page_state/ {found=1} END{exit !found}' "$f"; then
+              perl -0777 -pe 's/(\n\s*zspages\s*\+=\s*zone_page_state\s*\(\s*zone\s*,\s*NR_ZSPAGES\s*\)\s*;\s*\n)/\n#ifdef CONFIG_ZSMALLOC\1#endif\n/s' -i "$f"
+              echo "Guard NR_ZSPAGES aplicado em $f"
+            else
+              echo "Guard já presente em $f"
+            fi
+          else
+            echo "NR_ZSPAGES não encontrado em $f (nada a fazer)"
+          fi
+
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
