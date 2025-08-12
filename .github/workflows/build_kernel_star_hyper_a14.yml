@@ -166,6 +166,40 @@ jobs:
             echo "→ Nada a fazer (arquivo inexistente ou já guardado)"
           fi
 
+      - name: Disable KernelSU SELinux glue if kernel SELinux is enabled
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          mk="drivers/kernelsu/Makefile"
+          if [[ -f "$mk" ]]; then
+            # idempotente: remove 'selinux/' de qualquer linha obj-... += ...
+            if grep -q 'selinux/' "$mk"; then
+              sed -i -E 's|(obj[^=]*\+=.*)selinux/ ?|\1|g' "$mk"
+              echo "→ Removido selinux/ de $mk (KernelSU)"
+            else
+              echo "→ selinux/ já não está sendo incluído"
+            fi
+          fi
+
+      - name: Patch taskstats (guard NR_ZSPAGES)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          f="kernel/taskstats.c"
+          # só aplica se a linha existir e ainda não estiver guardada
+          if grep -q 'NR_ZSPAGES' "$f" && ! grep -q 'CONFIG_ZSMALLOC' "$f"; then
+            awk '{
+              if ($0 ~ /NR_ZSPAGES/ && !printed) { print "#ifdef CONFIG_ZSMALLOC"; print; printed=1; next }
+              print
+            } END { if (printed) print "#endif /* CONFIG_ZSMALLOC */" }' "$f" > "$f.new"
+            mv "$f.new" "$f"
+            echo "→ Guard inserido em $f"
+          else
+            echo "→ Nada a fazer em $f"
+          fi
+
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
