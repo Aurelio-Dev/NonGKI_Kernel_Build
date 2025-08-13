@@ -246,6 +246,8 @@ jobs:
           # remove qualquer sujeira gerada na raiz da árvore
           rm -f .config || true
           rm -rf include/config arch/arm64/include/generated || true
+          git reset --hard HEAD || true
+          git clean -fdx || true
           make ARCH=arm64 mrproper || true
           # recria a pasta de build limpa
           rm -rf out
@@ -262,6 +264,9 @@ jobs:
           export KBUILD_OUTPUT=out
       
           # 1) Resolver defconfig
+          # Sanity: garanta que a raiz está limpa antes do 1º make
+          rm -f .config || true
+          rm -rf include/config arch/arm64/include/generated || true
           want="${DEFCONFIG_NAME}"
           base="${want##*/}"
           path1="arch/arm64/configs/${want}"
