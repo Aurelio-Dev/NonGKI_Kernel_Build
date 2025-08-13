@@ -238,12 +238,28 @@ jobs:
             echo "NR_ZSPAGES não encontrado em $f (nada a fazer)"
           fi
 
+      - name: Clean source tree (mrproper + fresh out)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          # remove qualquer sujeira gerada na raiz da árvore
+          rm -f .config || true
+          rm -rf include/config arch/arm64/include/generated || true
+          make ARCH=arm64 mrproper || true
+          # recria a pasta de build limpa
+          rm -rf out
+          mkdir -p out
+          # garante que sub-makes sempre usem out/
+          export KBUILD_OUTPUT=out
+
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
           export KCONFIG_CONFIG=out/.config
+          export KBUILD_OUTPUT=out
       
           # 1) Resolver defconfig
           want="${DEFCONFIG_NAME}"
