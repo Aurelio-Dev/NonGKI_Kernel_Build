@@ -303,7 +303,6 @@ jobs:
           set -e
           exit $rc
 
-
       - name: Diagnóstico de falha (se houver)
         if: failure()
         shell: bash
