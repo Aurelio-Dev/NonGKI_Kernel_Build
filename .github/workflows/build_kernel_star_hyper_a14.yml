@@ -243,3 +243,105 @@ jobs:
             echo "→ Guard já presente ou linha não encontrada"
           fi
 
+      - name: Configurar e compilar (robusto)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
+          export KBUILD_OUTPUT=out
+      
+          # 1) Resolver defconfig
+          # Sanity: garanta que a raiz está limpa antes do 1º make
+          rm -f .config || true
+          rm -rf include/config arch/arm64/include/generated || true
+          want="${DEFCONFIG_NAME}"
+          base="${want##*/}"
+          path1="arch/arm64/configs/${want}"
+          found=""
+          if [[ -f "$path1" ]]; then
+            found="$want"
+          else
+            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
+            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
+          fi
+          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
+          echo "→ Usando defconfig: $found"
+      
+          # 2) Gerar .config
+          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
+          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
+          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
+      
+          # 3) (Opcional) overrides – sem 'yes'
+          chmod +x ./scripts/config
+          ./scripts/config --file out/.config -e CONFIG_ZRAM      || true
+          ./scripts/config --file out/.config -e CONFIG_ZSMALLOC  || true
+          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig  2>&1 | tee -a build.log
+          # 🔎 Check final .config (apenas log – não falha o job)
+          echo "→ Checando ZSMALLOC/ZRAM no .config"
+          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
+          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
+            echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
+          fi
+ 
+          # 4) Build
+          set +e
+          make -j"$(nproc)" \
+               O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
+               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               HOSTCC=clang HOSTCXX=clang++ V=1 \
+               2>&1 | tee -a build.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          exit $rc
+
+      - name: Diagnóstico de falha (se houver)
+        if: failure()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          export KCONFIG_CONFIG=out/.config
+          echo "=== HEAD do log (200 linhas) ==="; head -n 200 build.log || true
+          echo "=== TAIL do log (200 linhas) ==="; tail -n 200 build.log || true
+          echo "=== Erros encontrados (contexto ±3) ==="
+          grep -nEi -C3 '(^|[[:space:]])(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
+          echo "=== .config (parcial) ==="
+          test -f out/.config && sed -n '1,200p' out/.config || true
+
+      - name: Upload de logs e .config
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-kernel-logs
+          path: |
+            ${{ env.KERNEL_DIR }}/build.log
+            ${{ env.KERNEL_DIR }}/out/.config
+
+      - name: Empacotar com AnyKernel3
+        if: success()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE"
+          rm -rf AnyKernel3
+          git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
+          KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
+          if [[ ! -f "$KIMG" ]]; then
+            echo "::error::Kernel Image não encontrado em $KIMG"
+            ls -la "$KERNEL_DIR/out/arch/arm64/boot" || true
+            exit 2
+          fi
+          cp -fv "$KIMG" AnyKernel3/
+          cd AnyKernel3
+          zip -r9 "../kernel-${ROM_TEXT:-build}.zip" . -x "*.git*"
+          echo "ZIP_PATH=$GITHUB_WORKSPACE/kernel-${ROM_TEXT:-build}.zip" >> "$GITHUB_ENV"
+
+      - name: Publicar artefato
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ env.ROM_TEXT || 'build' }}
+          path: ${{ env.ZIP_PATH }}
+
