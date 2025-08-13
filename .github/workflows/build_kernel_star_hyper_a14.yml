@@ -171,13 +171,6 @@ jobs:
             echo "→ Nada a fazer (arquivo inexistente ou já guardado)"
           fi
 
-      - name: Publicar artefato
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-${{ env.ROM_TEXT || 'build' }}
-          path: ${{ env.ZIP_PATH }}
-
       - name: Clean source tree (mrproper + fresh out)
         shell: bash
         run: |
