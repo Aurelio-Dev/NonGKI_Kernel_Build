@@ -171,188 +171,75 @@ jobs:
             echo "→ Nada a fazer (arquivo inexistente ou já guardado)"
           fi
 
-      - name: Disable KernelSU SELinux glue (robusto)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-      
-          mk="drivers/kernelsu/Makefile"
-          if [[ -f "$mk" ]]; then
-            # remove referências a 'selinux' em obj-* e subdir-*
-            sed -i -E 's/^(\s*(obj|subdir)[^=]*\+=[^#]*)(\bselinux(\/[[:alnum:]._-]+)?)([[:space:]]*)/\1 \5/g' "$mk"
-            # compacta espaços duplicados
-            sed -i -E 's/[[:space:]]{2,}/ /g' "$mk"
-          fi
-      
-          # sanity check: nenhum Makefile do KSU deve referenciar selinux após o patch
-          if grep -RInE '^\s*(obj|subdir)[^=]*\+=.*\bselinux(\/|[[:space:]])' drivers/kernelsu 2>/dev/null; then
-            echo "::error::Ainda restam referências a selinux/ em drivers/kernelsu/*Makefile"
-            grep -RInE '^\s*(obj|subdir)[^=]*\+=.*\bselinux(\/|[[:space:]])' drivers/kernelsu || true
-            exit 3
-          fi
-      
-          echo "→ Glue de SELinux do KernelSU desativado (subdir/obj)."
-
-      - name: Patch taskstats (guard NR_ZSPAGES — robusto)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-          export KCONFIG_CONFIG=out/.config
-          f="kernel/taskstats.c"
-          line="$(grep -n 'NR_ZSPAGES' "$f" | head -n1 | cut -d: -f1 || true)"
-          if [ -n "$line" ]; then
-            # se já houver guard imediato, não duplica
-            if sed -n "$((line-2)),$((line))p" "$f" | grep -q 'CONFIG_ZSMALLOC'; then
-              echo "→ Já protegido, nada a fazer"
-              exit 0
-            fi
-            head -n $((line-1)) "$f" > "$f.new"
-            echo '#if defined(CONFIG_ZSMALLOC)' >> "$f.new"
-            sed -n "${line}p" "$f" >> "$f.new"
-            echo '#endif /* CONFIG_ZSMALLOC */' >> "$f.new"
-            tail -n +$((line+1)) "$f" >> "$f.new"
-            mv "$f.new" "$f"
-            echo "→ Guard inserido em $f (linha $line)"
-          else
-            echo "→ NR_ZSPAGES não encontrado em $f; nada a fazer"
-          fi
-
-      - name: Guard NR_ZSPAGES em taskstats.c (idempotente)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-      
-          f="kernel/taskstats.c"
-          # Só mexe se a linha existir e ainda não estiver guardada por CONFIG_ZSMALLOC
-          if grep -q 'zone_page_state *([^,]*, *NR_ZSPAGES)' "$f"; then
-            if ! awk 'found && /#endif/ {exit} /NR_ZSPAGES/ && /zone_page_state/ {found=1} END{exit !found}' "$f"; then
-              perl -0777 -pe 's/(\n\s*zspages\s*\+=\s*zone_page_state\s*\(\s*zone\s*,\s*NR_ZSPAGES\s*\)\s*;\s*\n)/\n#ifdef CONFIG_ZSMALLOC\1#endif\n/s' -i "$f"
-              echo "Guard NR_ZSPAGES aplicado em $f"
-            else
-              echo "Guard já presente em $f"
-            fi
-          else
-            echo "NR_ZSPAGES não encontrado em $f (nada a fazer)"
-          fi
-
-      - name: Clean source tree (mrproper + fresh out)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-          # remove qualquer sujeira gerada na raiz da árvore
-          rm -f .config || true
-          rm -rf include/config arch/arm64/include/generated || true
-          git reset --hard HEAD || true
-          git clean -fdx || true
-          make ARCH=arm64 mrproper || true
-          # recria a pasta de build limpa
-          rm -rf out
-          mkdir -p out
-          # garante que sub-makes sempre usem out/
-          export KBUILD_OUTPUT=out
-
-      - name: Configurar e compilar (robusto)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$KERNEL_DIR"
-          export KCONFIG_CONFIG=out/.config
-          export KBUILD_OUTPUT=out
-      
-          # 1) Resolver defconfig
-          # Sanity: garanta que a raiz está limpa antes do 1º make
-          rm -f .config || true
-          rm -rf include/config arch/arm64/include/generated || true
-          want="${DEFCONFIG_NAME}"
-          base="${want##*/}"
-          path1="arch/arm64/configs/${want}"
-          found=""
-          if [[ -f "$path1" ]]; then
-            found="$want"
-          else
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
-          fi
-          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
-          echo "→ Usando defconfig: $found"
-      
-          # 2) Gerar .config
-          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
-          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
-          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
-      
-          # 3) (Opcional) overrides – sem 'yes'
-          chmod +x ./scripts/config
-          ./scripts/config --file out/.config -e CONFIG_ZRAM      || true
-          ./scripts/config --file out/.config -e CONFIG_ZSMALLOC  || true
-          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig  2>&1 | tee -a build.log
-          # 🔎 Check final .config (apenas log – não falha o job)
-          echo "→ Checando ZSMALLOC/ZRAM no .config"
-          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
-          if ! grep -q '^CONFIG_ZSMALLOC=y' out/.config; then
-            echo "::warning::CONFIG_ZSMALLOC não ficou =y; seguiremos com o guard NR_ZSPAGES."
-          fi
- 
-          # 4) Build
-          set +e
-          make -j"$(nproc)" \
-               O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
-               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-               HOSTCC=clang HOSTCXX=clang++ V=1 \
-               2>&1 | tee -a build.log
-          rc=${PIPESTATUS[0]}
-          set -e
-          exit $rc
-
-      - name: Diagnóstico de falha (se houver)
-        if: failure()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-          export KCONFIG_CONFIG=out/.config
-          echo "=== HEAD do log (200 linhas) ==="; head -n 200 build.log || true
-          echo "=== TAIL do log (200 linhas) ==="; tail -n 200 build.log || true
-          echo "=== Erros encontrados (contexto ±3) ==="
-          grep -nEi -C3 '(^|[[:space:]])(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
-          echo "=== .config (parcial) ==="
-          test -f out/.config && sed -n '1,200p' out/.config || true
-
-      - name: Upload de logs e .config
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-kernel-logs
-          path: |
-            ${{ env.KERNEL_DIR }}/build.log
-            ${{ env.KERNEL_DIR }}/out/.config
-
-      - name: Empacotar com AnyKernel3
-        if: success()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$GITHUB_WORKSPACE"
-          rm -rf AnyKernel3
-          git clone --depth 1 --branch "${AK3_BRANCH:-master}" "${AK3_SOURCE}" AnyKernel3
-          KIMG="$KERNEL_DIR/out/arch/arm64/boot/Image.gz-dtb"
-          if [[ ! -f "$KIMG" ]]; then
-            echo "::error::Kernel Image não encontrado em $KIMG"
-            ls -la "$KERNEL_DIR/out/arch/arm64/boot" || true
-            exit 2
-          fi
-          cp -fv "$KIMG" AnyKernel3/
-          cd AnyKernel3
-          zip -r9 "../kernel-${ROM_TEXT:-build}.zip" . -x "*.git*"
-          echo "ZIP_PATH=$GITHUB_WORKSPACE/kernel-${ROM_TEXT:-build}.zip" >> "$GITHUB_ENV"
-
       - name: Publicar artefato
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: kernel-${{ env.ROM_TEXT || 'build' }}
           path: ${{ env.ZIP_PATH }}
+
+      - name: Clean source tree (mrproper + fresh out)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          # Limpa sujeira na RAIZ da árvore
+          rm -f .config || true
+          rm -rf include/config arch/arm64/include/generated || true
+          git reset --hard HEAD || true
+          git clean -fdx || true
+          make ARCH=arm64 mrproper || true
+          # Recria diretório de build e fixa out-of-tree
+          rm -rf out
+          mkdir -p out
+          export KBUILD_OUTPUT=out
+
+      - name: Ensure KernelSU present (after clean)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          if [ ! -f drivers/kernelsu/Kconfig ]; then
+            echo "→ (re)injetando KernelSU..."
+            rm -rf drivers/kernelsu
+            git clone --depth=1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE:-https://github.com/tiann/KernelSU.git}" .kernelsu_tmp
+            mkdir -p drivers/kernelsu
+            if command -v rsync >/dev/null 2>&1; then
+              rsync -a --delete .kernelsu_tmp/ drivers/kernelsu/
+            else
+              cp -a .kernelsu_tmp/. drivers/kernelsu/
+            fi
+            rm -rf .kernelsu_tmp
+          else
+            echo "→ KernelSU já presente."
+          fi
+
+      - name: Disable KernelSU SELinux glue (robusto)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          mk="drivers/kernelsu/Makefile"
+          if [ -f "$mk" ]; then
+            # remove 'selinux/' de obj-... += ... e subdir-... += ...
+            sed -i -E 's#^(\s*(obj|subdir)[^=]*\+=.*)\bselinux/( ?)#\1#g' "$mk"
+            sed -i -E 's/[[:space:]]{2,}/ /g' "$mk"
+            if grep -nE '^\s*(obj|subdir)[^=]*\+=.*\bselinux/' "$mk"; then
+              echo "::error::Ainda está listando selinux/ em obj/subdir no Makefile do KSU"; exit 3
+            fi
+          fi
+
+      - name: Guard NR_ZSPAGES in taskstats.c (robusto)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          f="kernel/taskstats.c"
+          # aplica guard apenas se necessário
+          if grep -q 'zone_page_state *(.*NR_ZSPAGES)' "$f" &&              ! awk 'f&&/#endif/{exit} /NR_ZSPAGES/&&/zone_page_state/{f=1} END{exit !f}' "$f"; then
+            perl -0777 -pe 's/(\n\s*zspages\s*\+=\s*zone_page_state\s*\(\s*zone\s*,\s*NR_ZSPAGES\s*\)\s*;\s*\n)/\n#ifdef CONFIG_ZSMALLOC\1#endif\n/s' -i "$f"
+            echo "→ Guard NR_ZSPAGES aplicado"
+          else
+            echo "→ Guard já presente ou linha não encontrada"
+          fi
+
