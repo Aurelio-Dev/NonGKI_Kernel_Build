@@ -57,25 +57,48 @@ jobs:
           cd "$KERNEL_DIR"
           echo "→ Verificando drivers/Kconfig (deve referenciar kernelsu/Kconfig)"
           grep -nE 'kernelsu/Kconfig' drivers/Kconfig || true
+      
           if [ ! -f drivers/kernelsu/Kconfig ]; then
             echo "→ (re)injetando KernelSU..."
             rm -rf drivers/kernelsu
             git clone --depth=1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE:-https://github.com/tiann/KernelSU.git}" .kernelsu_tmp
             mkdir -p drivers/kernelsu
+      
+            # detecta onde está o Kconfig no repo do KernelSU
+            src_dir=""
+            for cand in ".kernelsu_tmp/kernel" ".kernelsu_tmp/KernelSU/kernel" ".kernelsu_tmp"; do
+              if [ -f "$cand/Kconfig" ]; then
+                src_dir="$cand"
+                break
+              fi
+            done
+      
+            if [ -z "$src_dir" ]; then
+              echo "::error::Nenhum Kconfig encontrado no repositório do KernelSU"
+              ls -la .kernelsu_tmp || true
+              find .kernelsu_tmp -maxdepth 2 -type f -name Kconfig || true
+              exit 5
+            fi
+      
+            echo "→ Copiando do subdiretório do KernelSU: $src_dir → drivers/kernelsu/"
             if command -v rsync >/dev/null 2>&1; then
-              rsync -a --delete .kernelsu_tmp/ drivers/kernelsu/
+              rsync -a --delete "$src_dir"/ drivers/kernelsu/
             else
-              cp -a .kernelsu_tmp/. drivers/kernelsu/
+              cp -a "$src_dir"/. drivers/kernelsu/
             fi
             rm -rf .kernelsu_tmp
           else
             echo "→ KernelSU já presente."
           fi
+      
           # Verificação final obrigatória
           if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "::error::drivers/kernelsu/Kconfig ausente após reinjeção"; ls -la drivers || true; exit 5;
+            echo "::error::drivers/kernelsu/Kconfig ausente após reinjeção"
+            ls -la drivers || true
+            exit 5
           fi
           echo "→ Confirmado: drivers/kernelsu/Kconfig presente."
+
 
       - name: Disable KernelSU SELinux glue (robusto)
         shell: bash
