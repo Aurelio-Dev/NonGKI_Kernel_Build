@@ -53,53 +53,76 @@ jobs:
           mkdir -p out
           export KBUILD_OUTPUT=out
 
-      - name: Ensure KernelSU present (after clean)
+      - name: Injetar/normalizar KernelSU em drivers/kernelsu (layout-agnóstico)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          echo "→ Verificando drivers/Kconfig (deve referenciar kernelsu/Kconfig)"
-          grep -nE 'kernelsu/Kconfig' drivers/Kconfig || true
-
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "→ (re)injetando KernelSU..."
-            rm -rf drivers/kernelsu
-            git clone --depth=1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE:-https://github.com/tiann/KernelSU.git}" .kernelsu_tmp
-            mkdir -p drivers/kernelsu
-
-            # Detecta layout do repositório do KernelSU e copia o subdiretório certo
-            src_dir=""
-            for cand in ".kernelsu_tmp/kernel" ".kernelsu_tmp/KernelSU/kernel" ".kernelsu_tmp"; do
-              if [ -f "$cand/Kconfig" ]; then
-                src_dir="$cand"
-                break
-              fi
-            done
-            if [ -z "$src_dir" ]; then
-              echo "::error::Nenhum Kconfig encontrado no repositório do KernelSU"
-              ls -la .kernelsu_tmp || true
-              find .kernelsu_tmp -maxdepth 3 -name Kconfig || true
-              exit 5
+      
+          rm -rf drivers/kernelsu drivers/KernelSU .kernelsu_tmp || true
+          git clone --depth=1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE:-https://github.com/tiann/KernelSU.git}" .kernelsu_tmp
+      
+          # Detecta onde está o Kconfig do KernelSU
+          src_dir=""
+          for cand in ".kernelsu_tmp/kernel" ".kernelsu_tmp/KernelSU/kernel" ".kernelsu_tmp"; do
+            if [ -f "$cand/Kconfig" ]; then
+              src_dir="$cand"
+              break
             fi
-
-            echo "→ Copiando do subdiretório do KernelSU: $src_dir → drivers/kernelsu/"
-            if command -v rsync >/dev/null 2>&1; then
-              rsync -a --delete "$src_dir"/ drivers/kernelsu/
-            else
-              cp -a "$src_dir"/. drivers/kernelsu/
-            fi
-            rm -rf .kernelsu_tmp
-          else
-            echo "→ KernelSU já presente."
-          fi
-
-          # Verificação final obrigatória
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "::error::drivers/kernelsu/Kconfig ausente após reinjeção"
-            ls -la drivers || true
+          done
+          if [ -z "$src_dir" ]; then
+            echo "::error::Nenhum Kconfig encontrado no repositório do KernelSU"; ls -la .kernelsu_tmp; find .kernelsu_tmp -maxdepth 3 -name Kconfig || true
             exit 5
           fi
-          echo "→ Confirmado: drivers/kernelsu/Kconfig presente."
+      
+          # Copia para drivers/kernelsu/
+          mkdir -p drivers/kernelsu
+          rsync -a --delete "$src_dir"/ drivers/kernelsu/
+      
+          # Se vier só Kbuild, cria Makefile compatível
+          if [ ! -f drivers/kernelsu/Makefile ] && [ -f drivers/kernelsu/Kbuild ]; then
+            printf 'include $(src)/Kbuild\n' > drivers/kernelsu/Makefile
+          fi
+      
+          # Sincroniza referências em drivers/ (Makefile e Kconfig)
+          grep -q 'obj-y[[:space:]]\+\+=\s*kernelsu/' drivers/Makefile 2>/dev/null || echo 'obj-y += kernelsu/' >> drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null || echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
+      
+          # Debug rápido
+          ls -la drivers/kernelsu | sed 's/^/KSU: /'
+          grep -n 'kernelsu/Kconfig' drivers/Kconfig || true
+      
+      - name: Neutralizar glue de SELinux do KernelSU (robusto)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+      
+          # Remove árvore selinux (se houver) e comenta referências
+          if [ -d drivers/kernelsu/selinux ]; then
+            rm -rf drivers/kernelsu/selinux
+          fi
+          if [ -f drivers/kernelsu/Makefile ]; then
+            sed -ri 's@(^[[:space:]]*obj-[^=]*=.*selinux/.*$)@# \0@' drivers/kernelsu/Makefile || true
+            sed -ri 's@(^[[:space:]]*obj-y[[:space:]]*\+=.*selinux/.*$)@# \0@' drivers/kernelsu/Makefile || true
+          fi
+          if [ -f drivers/kernelsu/Kconfig ]; then
+            sed -ri 's@^[[:space:]]*source[[:space:]]+"drivers/kernelsu/selinux/Kconfig"@# &@' drivers/kernelsu/Kconfig || true
+          fi
+          # Stub vazio à prova de include acidental
+          mkdir -p drivers/kernelsu/selinux
+          printf 'obj-y :=\n' > drivers/kernelsu/selinux/Makefile
+          printf '# disabled\n' > drivers/kernelsu/selinux/Kconfig
+      
+      - name: Asserts de pré-defconfig (KSU presente e referenciado)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          # Arquivo precisa existir
+          [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente"; exit 6; }
+          # drivers/Kconfig precisa referenciar
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::drivers/Kconfig não referencia drivers/kernelsu/Kconfig"; exit 7; }
 
       # ======= ALTERAÇÃO: neutralizar glue de SELinux do KSU de forma forçada =======
       - name: Disable KernelSU SELinux glue (force)
