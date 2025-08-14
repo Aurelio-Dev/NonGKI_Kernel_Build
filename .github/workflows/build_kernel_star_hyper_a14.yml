@@ -29,7 +29,7 @@ jobs:
         run: |
           sudo apt-get update -yq
           sudo apt-get install -yqq bc bison flex libssl-dev build-essential \
-                                  ccache libelf-dev libncurses-dev rsync clang lld llvm
+                                  ccache libelf-dev libncurses-dev rsync clang lld llvm zip
 
       - name: Fetch kernel source
         run: |
@@ -51,17 +51,16 @@ jobs:
           # Recria diretório de build e fixa out-of-tree
           rm -rf out
           mkdir -p out
-          export KBUILD_OUTPUT=out
 
       - name: Injetar/normalizar KernelSU em drivers/kernelsu (layout-agnóstico)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-      
+
           rm -rf drivers/kernelsu drivers/KernelSU .kernelsu_tmp || true
           git clone --depth=1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE:-https://github.com/tiann/KernelSU.git}" .kernelsu_tmp
-      
+
           # Detecta onde está o Kconfig do KernelSU
           src_dir=""
           for cand in ".kernelsu_tmp/kernel" ".kernelsu_tmp/KernelSU/kernel" ".kernelsu_tmp"; do
@@ -74,30 +73,30 @@ jobs:
             echo "::error::Nenhum Kconfig encontrado no repositório do KernelSU"; ls -la .kernelsu_tmp; find .kernelsu_tmp -maxdepth 3 -name Kconfig || true
             exit 5
           fi
-      
+
           # Copia para drivers/kernelsu/
           mkdir -p drivers/kernelsu
           rsync -a --delete "$src_dir"/ drivers/kernelsu/
-      
+
           # Se vier só Kbuild, cria Makefile compatível
           if [ ! -f drivers/kernelsu/Makefile ] && [ -f drivers/kernelsu/Kbuild ]; then
             printf 'include $(src)/Kbuild\n' > drivers/kernelsu/Makefile
           fi
-      
+
           # Sincroniza referências em drivers/ (Makefile e Kconfig)
           grep -q 'obj-y[[:space:]]\+\+=\s*kernelsu/' drivers/Makefile 2>/dev/null || echo 'obj-y += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null || echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
-      
+
           # Debug rápido
           ls -la drivers/kernelsu | sed 's/^/KSU: /'
           grep -n 'kernelsu/Kconfig' drivers/Kconfig || true
-      
+
       - name: Neutralizar glue de SELinux do KernelSU (robusto)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-      
+
           # Remove árvore selinux (se houver) e comenta referências
           if [ -d drivers/kernelsu/selinux ]; then
             rm -rf drivers/kernelsu/selinux
@@ -113,46 +112,6 @@ jobs:
           mkdir -p drivers/kernelsu/selinux
           printf 'obj-y :=\n' > drivers/kernelsu/selinux/Makefile
           printf '# disabled\n' > drivers/kernelsu/selinux/Kconfig
-      
-      - name: Asserts de pré-defconfig (KSU presente e referenciado)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-          # Arquivo precisa existir
-          [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente"; exit 6; }
-          # drivers/Kconfig precisa referenciar
-          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::drivers/Kconfig não referencia drivers/kernelsu/Kconfig"; exit 7; }
-
-      # ======= ALTERAÇÃO: neutralizar glue de SELinux do KSU de forma forçada =======
-      - name: Disable KernelSU SELinux glue (force)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$KERNEL_DIR"
-
-          # 1) Remova a árvore selinux do KSU (se existir)
-          if [ -d drivers/kernelsu/selinux ]; then
-            rm -rf drivers/kernelsu/selinux
-          fi
-
-          # 2) Comente qualquer referência a 'selinux/' no Makefile do KSU
-          if [ -f drivers/kernelsu/Makefile ]; then
-            sed -ri 's@(^[[:space:]]*obj-[^=]*=.*selinux/.*$)@# \0@' drivers/kernelsu/Makefile || true
-            sed -ri 's@(^[[:space:]]*obj-y[[:space:]]*\+=.*selinux/.*$)@# \0@' drivers/kernelsu/Makefile || true
-          fi
-
-          # 3) Comente o "source" para Kconfig de selinux dentro do Kconfig do KSU, se existir
-          if [ -f drivers/kernelsu/Kconfig ]; then
-            sed -ri 's@^[[:space:]]*source[[:space:]]+"drivers/kernelsu/selinux/Kconfig"@# &@' drivers/kernelsu/Kconfig || true
-          fi
-
-          # 4) Segurança extra: stub vazio (idempotente)
-          mkdir -p drivers/kernelsu/selinux
-          printf 'obj-y :=\n' > drivers/kernelsu/selinux/Makefile
-          printf '# disabled\n' > drivers/kernelsu/selinux/Kconfig
-
-          echo "✓ KernelSU SELinux glue neutralizado (force)."
 
       - name: Guard NR_ZSPAGES in taskstats.c (robusto)
         shell: bash
@@ -168,6 +127,14 @@ jobs:
             echo "→ Guard já presente ou linha não encontrada"
           fi
 
+      - name: Pré-defconfig – garantir árvore fonte limpa (segunda passada)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          rm -f .config || true
+          rm -rf include/config arch/arm64/include/generated || true
+
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
@@ -176,10 +143,9 @@ jobs:
           export KCONFIG_CONFIG=out/.config
           export KBUILD_OUTPUT=out
 
-          # KSU deve existir
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "::error::drivers/kernelsu/Kconfig ausente antes do defconfig"; exit 6;
-          fi
+          # Asserts (falhar cedo se KSU sumiu ou não está referenciado)
+          [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente antes do defconfig"; exit 6; }
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::drivers/Kconfig não referencia drivers/kernelsu/Kconfig"; exit 7; }
 
           # 1) Resolver defconfig
           rm -f .config || true
@@ -202,14 +168,24 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
           make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
 
-          # 3) Overrides – sem 'yes'
-          chmod +x ./scripts/config
-          ./scripts/config --file out/.config -e CONFIG_ZRAM      || true
-          ./scripts/config --file out/.config -e CONFIG_ZSMALLOC  || true
-          make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
+          # 2.1) Garante que out/.config existe antes de usar scripts/config
+          if [ ! -f out/.config ]; then
+            echo "::warning::out/.config ausente após syncconfig; refazendo olddefconfig"
+            make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig 2>&1 | tee -a build.log
+          fi
+
+          # 3) Overrides – sem 'yes' (somente se .config existir)
+          if [ -f out/.config ]; then
+            chmod +x ./scripts/config
+            ./scripts/config --file out/.config -e CONFIG_ZRAM      || true
+            ./scripts/config --file out/.config -e CONFIG_ZSMALLOC  || true
+            make O=out ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
+          else
+            echo "::warning::Pulando overrides pois out/.config continua ausente."
+          fi
 
           echo "→ Checando ZSMALLOC/ZRAM no .config"
-          grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
+          test -f out/.config && grep -E '^(CONFIG_ZSMALLOC|CONFIG_ZRAM)=' out/.config || true
 
           # 4) Build
           set +e
@@ -222,7 +198,6 @@ jobs:
           set -e
           exit $rc
 
-      # (Opcional) Empacotar com AnyKernel3
       - name: Empacotar com AnyKernel3
         if: success()
         shell: bash
