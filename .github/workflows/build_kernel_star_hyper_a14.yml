@@ -126,6 +126,14 @@ jobs:
             mv "$mf.new" "$mf"
           fi
 
+      - name: Pré-defconfig – zerar OUT_DIR
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+          rm -rf "$OUT_DIR" out
+          mkdir -p "$OUT_DIR"
+
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
@@ -156,6 +164,10 @@ jobs:
           fi
           [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
+
+          # >>> zerar OUT_DIR antes de gerar .config (evita 'source tree is not clean' no OUT)
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
       
           # 2) Gerar .config (não-interativo, com Clang) — agora sempre com LOCALVERSION=
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
