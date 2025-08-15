@@ -137,6 +137,10 @@ jobs:
           export KBUILD_OUTPUT="$OUT_DIR"
           export KCONFIG_CONFIG="$OUT_DIR/.config"
       
+          # Asserts (falhar cedo se KSU sumiu ou não está referenciado)
+          [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente antes do defconfig"; exit 6; }
+          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::drivers/Kconfig não referencia drivers/kernelsu/Kconfig"; exit 7; }
+      
           # 1) Resolver defconfig (começar limpo na ÁRVORE-FONTE)
           rm -f .config || true
           rm -rf include/config arch/arm64/include/generated || true
@@ -153,11 +157,11 @@ jobs:
           [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
       
-          # 2) Gerar .config (não-interativo, com Clang)
-          make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
-          make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
+          # 2) Gerar .config (não-interativo, com Clang) — agora sempre com LOCALVERSION=
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
       
-          # 3) Congelar símbolos que abriram prompt em runs anteriores
+          # 3) Congelar símbolos que abriam prompt em runs anteriores
           chmod +x ./scripts/config
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_COMPAT_VDSO || true
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_SHADOW_CALL_STACK || true
@@ -168,19 +172,32 @@ jobs:
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZRAM || true
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZSMALLOC || true
       
-          # 4) Finalizar de forma NÃO-interativa (sem 'yes' para não gerar Broken pipe)
-          make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
-          make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
+          # 3.1) ***FIX de versão: encurtar e congelar UTS_RELEASE***
+          ./scripts/config --file "$OUT_DIR/.config" --set-str CONFIG_LOCALVERSION "-star"
+          ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_LOCALVERSION_AUTO
+      
+          # 4) Finalizar de forma NÃO-interativa (sem 'yes' pra não dar Broken pipe)
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
+      
+          # 4.1) (Opcional) validar tamanho do UTS_RELEASE (<= 64 chars)
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld prepare 2>&1 | tee -a build.log || true
+          if [ -f "$OUT_DIR/include/generated/utsrelease.h" ]; then
+            rel=$(grep -oP '(?<=^#define UTS_RELEASE ").*(?="$)' "$OUT_DIR/include/generated/utsrelease.h" || true)
+            len=$(printf "%s" "$rel" | wc -c)
+            echo "UTS_RELEASE='$rel' (len=$len)"
+            [ "$len" -le 64 ] || { echo "::error::UTS_RELEASE > 64 chars"; exit 9; }
+          fi
       
           # (Opcional) amaciar o guard 'source tree is not clean' no Makefile do OUT
           sed -i -E 's/^[[:space:]]*false;[[:space:]]*$/: # pacified/' "$OUT_DIR"/Makefile || true
       
           echo "→ Checando flags no .config"
-          egrep -n '^(CONFIG_COMPAT_VDSO|CONFIG_SHADOW_CALL_STACK|CONFIG_LTO_(NONE|CLANG)|CONFIG_RELR|CONFIG_INIT_STACK_|CONFIG_INIT_ON_(ALLOC|FREE)_DEFAULT_ON|CONFIG_ZSMALLOC|CONFIG_ZRAM)=' "$OUT_DIR/.config" || true
+          egrep -n '^(CONFIG_(COMPAT_VDSO|SHADOW_CALL_STACK|LTO_(NONE|CLANG)|RELR|INIT_STACK_|INIT_ON_(ALLOC|FREE)_DEFAULT_ON|ZSMALLOC|ZRAM|LOCALVERSION|LOCALVERSION_AUTO))=' "$OUT_DIR/.config" || true
       
           # 5) Build
           set +e
-          make -j"$(nproc)" \
+          make LOCALVERSION= -j"$(nproc)" \
                O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ V=1 \
@@ -188,7 +205,6 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           exit $rc
-
 
       - name: Empacotar com AnyKernel3
         if: success()
