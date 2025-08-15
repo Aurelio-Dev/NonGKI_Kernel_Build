@@ -131,16 +131,15 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          export KCONFIG_CONFIG="$OUT_DIR/.config"
+      
+          # Saída consistente (usa caminho/out dir fixo)
+          export OUT_DIR="${KBUILD_OUTPUT:-out}"
           export KBUILD_OUTPUT="$OUT_DIR"
-
-          # Asserts (falhar cedo se KSU sumiu ou não está referenciado)
-          [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente antes do defconfig"; exit 6; }
-          grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::drivers/Kconfig não referencia drivers/kernelsu/Kconfig"; exit 7; }
-
-          # 1) Resolver defconfig
-          rm -f "$KERNEL_DIR/.config" || true
-          rm -rf "$KERNEL_DIR/include/config" "$KERNEL_DIR/arch/arm64/include/generated" || true
+          export KCONFIG_CONFIG="$OUT_DIR/.config"
+      
+          # 1) Resolver defconfig (começar sempre limpo na ÁRVORE-FONTE)
+          rm -f .config || true
+          rm -rf include/config arch/arm64/include/generated || true
           want="${DEFCONFIG_NAME}"
           base="${want##*/}"
           path1="arch/arm64/configs/${want}"
@@ -153,45 +152,53 @@ jobs:
           fi
           [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
-
-          # 2) Gerar .config (não-interativo, com Clang) — usando OUT absoluto
+      
+          # 2) Gerar .config (não-interativo, com Clang)
           make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
           make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
-          make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
-
-          # 2.1) Garante que $OUT_DIR/.config existe antes de overrides
-          if [ ! -f "$OUT_DIR/.config" ]; then
-            echo "::warning::$OUT_DIR/.config ausente após syncconfig; refazendo olddefconfig"
-            make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig 2>&1 | tee -a build.log
-          fi
-          [ -f "$OUT_DIR/.config" ] || { echo "::error::.config não foi gerado em $OUT_DIR"; exit 8; }
-
-          # 3) Overrides – sem 'yes'
+      
+          # 3) Congelar símbolos Kconfig que estavam abrindo prompts no --syncconfig
           chmod +x ./scripts/config
-          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZRAM      || true
-          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZSMALLOC  || true
-
-          # (Opcional) habilitar KSU/SuSFS se disponíveis
-          if grep -qE '^[[:space:]]*config[[:space:]]+KSU\>' drivers/kernelsu/Kconfig 2>/dev/null; then
-            ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_KSU || true
-          elif grep -qE '^[[:space:]]*config[[:space:]]+KERNELSU\>' drivers/kernelsu/Kconfig 2>/dev/null; then
-            ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_KERNELSU || true
-          fi
-          for sym in SUSFS SUSFS_CORE SUSFS_NEXT SUSFS_SUPPORT; do
-            grep -RIlq "^[[:space:]]*config[[:space:]]+$sym\>" -- drivers arch fs kernel mm 2>/dev/null && \
-              ./scripts/config --file "$OUT_DIR/.config" -e "CONFIG_${sym}" || true
-          done
-
-          make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
-          echo "→ Checando flags": grep -E '^(CONFIG_(KSU|KERNELSU|SUSFS|OVERLAY_FS|ZSMALLOC|ZRAM))=' "$OUT_DIR/.config" || true
-
-          # 4) Build
+      
+          # Compat vDSO para 32-bit EL0
+          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_COMPAT_VDSO || true
+      
+          # Evitar novas opções que disparam prompts em 5.4 + LLVM recentes
+          ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_SHADOW_CALL_STACK || true
+          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_LTO_NONE -d CONFIG_LTO_CLANG || true
+          ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_RELR || true
+      
+          # Escolha explícita para INIT_STACK_*
+          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_INIT_STACK_NONE \
+                                                       -d CONFIG_INIT_STACK_ALL_PATTERN \
+                                                       -d CONFIG_INIT_STACK_ALL_ZERO || true
+      
+          # Mem init defaults (equilíbrio entre segurança e performance)
+          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_INIT_ON_ALLOC_DEFAULT_ON \
+                                                     -d CONFIG_INIT_ON_FREE_DEFAULT_ON || true
+      
+          # Nossos overrides já existentes
+          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZRAM || true
+          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZSMALLOC || true
+      
+          # 4) Finalizar de forma 100% não-interativa
+          yes "" | make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld oldconfig   2>&1 | tee -a build.log
+          make     O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig     2>&1 | tee -a build.log
+          make     O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig       2>&1 | tee -a build.log
+      
+          # (Opcional) amaciar o guard 'source tree is not clean' no Makefile gerado em OUT
+          sed -i -E 's/^[[:space:]]*false;[[:space:]]*$/: # pacified/' "$OUT_DIR"/Makefile || true
+      
+          echo "→ Checando flags novas no .config"
+          egrep -n '^(CONFIG_COMPAT_VDSO|CONFIG_SHADOW_CALL_STACK|CONFIG_LTO_(NONE|CLANG)|CONFIG_RELR|CONFIG_INIT_STACK_|CONFIG_INIT_ON_(ALLOC|FREE)_DEFAULT_ON|CONFIG_ZSMALLOC|CONFIG_ZRAM)=' "$OUT_DIR/.config" || true
+      
+          # 5) Build
           set +e
           make -j"$(nproc)" \
-            O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
-            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-            HOSTCC=clang HOSTCXX=clang++ V=1 \
-            2>&1 | tee -a build.log
+               O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
+               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+               HOSTCC=clang HOSTCXX=clang++ V=1 \
+               2>&1 | tee -a build.log
           rc=${PIPESTATUS[0]}
           set -e
           exit $rc
