@@ -132,12 +132,12 @@ jobs:
           set -euxo pipefail
           cd "$KERNEL_DIR"
       
-          # Saída consistente (usa caminho/out dir fixo)
-          export OUT_DIR="${KBUILD_OUTPUT:-out}"
+          # Saída consistente
+          export OUT_DIR="${OUT_DIR:-$KERNEL_DIR/out}"
           export KBUILD_OUTPUT="$OUT_DIR"
           export KCONFIG_CONFIG="$OUT_DIR/.config"
       
-          # 1) Resolver defconfig (começar sempre limpo na ÁRVORE-FONTE)
+          # 1) Resolver defconfig (começar limpo na ÁRVORE-FONTE)
           rm -f .config || true
           rm -rf include/config arch/arm64/include/generated || true
           want="${DEFCONFIG_NAME}"
@@ -157,39 +157,25 @@ jobs:
           make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
           make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
       
-          # 3) Congelar símbolos Kconfig que estavam abrindo prompts no --syncconfig
+          # 3) Congelar símbolos que abriram prompt em runs anteriores
           chmod +x ./scripts/config
-      
-          # Compat vDSO para 32-bit EL0
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_COMPAT_VDSO || true
-      
-          # Evitar novas opções que disparam prompts em 5.4 + LLVM recentes
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_SHADOW_CALL_STACK || true
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_LTO_NONE -d CONFIG_LTO_CLANG || true
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_RELR || true
-      
-          # Escolha explícita para INIT_STACK_*
-          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_INIT_STACK_NONE \
-                                                       -d CONFIG_INIT_STACK_ALL_PATTERN \
-                                                       -d CONFIG_INIT_STACK_ALL_ZERO || true
-      
-          # Mem init defaults (equilíbrio entre segurança e performance)
-          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_INIT_ON_ALLOC_DEFAULT_ON \
-                                                     -d CONFIG_INIT_ON_FREE_DEFAULT_ON || true
-      
-          # Nossos overrides já existentes
+          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_INIT_STACK_NONE -d CONFIG_INIT_STACK_ALL_PATTERN -d CONFIG_INIT_STACK_ALL_ZERO || true
+          ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_INIT_ON_ALLOC_DEFAULT_ON -d CONFIG_INIT_ON_FREE_DEFAULT_ON || true
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZRAM || true
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZSMALLOC || true
       
-          # 4) Finalizar de forma 100% não-interativa
-          yes "" | make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld oldconfig   2>&1 | tee -a build.log
-          make     O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig     2>&1 | tee -a build.log
-          make     O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig       2>&1 | tee -a build.log
+          # 4) Finalizar de forma NÃO-interativa (sem 'yes' para não gerar Broken pipe)
+          make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
+          make O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
       
-          # (Opcional) amaciar o guard 'source tree is not clean' no Makefile gerado em OUT
+          # (Opcional) amaciar o guard 'source tree is not clean' no Makefile do OUT
           sed -i -E 's/^[[:space:]]*false;[[:space:]]*$/: # pacified/' "$OUT_DIR"/Makefile || true
       
-          echo "→ Checando flags novas no .config"
+          echo "→ Checando flags no .config"
           egrep -n '^(CONFIG_COMPAT_VDSO|CONFIG_SHADOW_CALL_STACK|CONFIG_LTO_(NONE|CLANG)|CONFIG_RELR|CONFIG_INIT_STACK_|CONFIG_INIT_ON_(ALLOC|FREE)_DEFAULT_ON|CONFIG_ZSMALLOC|CONFIG_ZRAM)=' "$OUT_DIR/.config" || true
       
           # 5) Build
@@ -202,6 +188,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           exit $rc
+
 
       - name: Empacotar com AnyKernel3
         if: success()
