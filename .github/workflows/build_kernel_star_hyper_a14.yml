@@ -30,6 +30,19 @@ jobs:
           sudo apt-get install -yqq bc bison flex libssl-dev build-essential \
                                   ccache libelf-dev libncurses-dev rsync clang lld llvm zip
 
+      - name: Enable 8G swap (estabiliza RAM)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          swapon --show
+          free -h
+
       - name: Fetch kernel source
         run: |
           set -euxo pipefail
@@ -172,7 +185,13 @@ jobs:
           # 2) Gerar .config (não-interativo, com Clang) — agora sempre com LOCALVERSION=
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
-      
+
+          # reduzir peso de compilação
+          ./scripts/config --file "$OUT_DIR/.config" \
+            -d CONFIG_DEBUG_INFO -d CONFIG_DEBUG_INFO_DWARF4 -d CONFIG_DEBUG_INFO_BTF \
+            -d CONFIG_GCOV_KERNEL
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig
+
           # 3) Congelar símbolos que abriam prompt em runs anteriores
           chmod +x ./scripts/config
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_COMPAT_VDSO || true
@@ -209,7 +228,7 @@ jobs:
       
           # 5) Build
           set +e
-          make LOCALVERSION= -j"$(nproc)" \
+          make LOCALVERSION= -j8 \
                O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ V=1 \
@@ -237,16 +256,14 @@ jobs:
 
       - name: Diagnóstico de falha (se houver)
         if: failure()
+        shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          export KCONFIG_CONFIG="$OUT_DIR/.config"
-          echo "=== HEAD do log (200 linhas) ==="; head -n 200 build.log || true
-          echo "=== TAIL do log (200 linhas) ==="; tail -n 200 build.log || true
-          echo "=== Erros encontrados (contexto ±3) ==="
-          grep -nEi -C3 '(^|[[:space:]])(error:|fatal error:|undefined reference|No rule to make target|No such file or directory)' build.log || true
-          echo "=== .config (parcial) ==="
-          test -f "$OUT_DIR/.config" && sed -n '1,200p' "$OUT_DIR/.config" || true
+          echo "=== HEAD do log (300) ==="; head -n 300 build.log || true
+          echo "=== TAIL do log (500) ==="; tail -n 500 build.log || true
+          echo "=== Erros encontrados (±3) ==="
+          grep -nEi -C3 '(^|[[:space:]])(error:|fatal error:|undefined reference|No rule to make target|No such file|make:[[:space:]]\*{3}|collect2:[[:space:]]error|ld\.lld:[[:space:]]error|clang:[[:space:]]error|Killed|Segmentation fault|Error[[:space:]][0-9]+)' build.log || true
 
       - name: Upload de artefatos
         if: always()
