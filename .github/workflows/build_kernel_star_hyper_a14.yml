@@ -95,22 +95,42 @@ jobs:
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
           grep -qE 'obj-(y|m).*=.*kernelsu/?' drivers/Makefile || echo 'obj-y += kernelsu/' >> drivers/Makefile
 
-      - name: Neutralizar glue de SELinux do KernelSU (robusto)
+      - name: Neutralizar glue de SELinux do KernelSU (preserva headers)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          [ -d drivers/kernelsu/selinux ] && rm -rf drivers/kernelsu/selinux
+
+          # Se não houver KernelSU, não faz nada
+          [ -d drivers/kernelsu ] || exit 0
+
+          # 1) NÃO apague drivers/kernelsu/selinux !!
+          # Precisamos manter os headers (selinux/selinux.h) que o allowlist.c inclui.
+
+          # 2) Desabilite a compilação do subdir selinux/ apenas comentando as referências
+          #    no Makefile/Kconfig do KernelSU (idempotente).
           if [ -f drivers/kernelsu/Makefile ]; then
-            sed -ri 's@(^[[:space:]]*obj-[^=]*=.*selinux/.*$)@# \0@' drivers/kernelsu/Makefile || true
-            sed -ri 's@(^[[:space:]]*obj-y[[:space:]]*\+=.*selinux/.*$)@# \0@' drivers/kernelsu/Makefile || true
+            sed -ri 's@(^[[:space:]]*obj-[^=]*\+=.*\bselinux/.*$)@# \0@g' drivers/kernelsu/Makefile || true
+            # Se existir linha adicionando diretamente allowlist.o, vamos condicionar ao SELinux
+            # somente se os headers não existirem (feito no passo 4 abaixo).
           fi
+
           if [ -f drivers/kernelsu/Kconfig ]; then
-            sed -ri 's@^[[:space:]]*source[[:space:]]+"drivers/kernelsu/selinux/Kconfig"@# &@' drivers/kernelsu/Kconfig || true
+            sed -ri 's@(^[[:space:]]*source[[:space:]]*"drivers/kernelsu/selinux/Kconfig".*$)@# \0@g' drivers/kernelsu/Kconfig || true
           fi
-          mkdir -p drivers/kernelsu/selinux
-          printf 'obj-y :=\n' > drivers/kernelsu/selinux/Makefile
-          printf '# disabled\n' > drivers/kernelsu/selinux/Kconfig
+
+          # 3) Garanta que o próprio diretório do KernelSU esteja no include path
+          #    (normalmente já está, mas não custa assegurar)
+          if [ -f drivers/kernelsu/Makefile ] && ! grep -q 'ccflags-y.*-I\$(src)' drivers/kernelsu/Makefile; then
+            echo 'ccflags-y += -I$(src)' >> drivers/kernelsu/Makefile
+          fi
+
+          # 4) Se POR ALGUMA RAZÃO os headers não estiverem presentes,
+          #    remova allowlist.o do build (para não quebrar).
+          if [ ! -f drivers/kernelsu/selinux/selinux.h ]; then
+            sed -ri 's@(^[[:space:]]*obj-[^=]*\+=.*\ballowlist\.o\b.*$)@# \0@g' drivers/kernelsu/Makefile || true
+          fi
+
 
       - name: Patch KernelSU for SELinux headers
         shell: bash
