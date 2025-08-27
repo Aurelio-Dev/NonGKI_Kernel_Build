@@ -59,6 +59,9 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+          
+          export LC_ALL=C
+          export LANG=C
           rm -f .config || true
           rm -rf include/config arch/arm64/include/generated || true
           git reset --hard HEAD || true
@@ -170,9 +173,9 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          # Baixa clang-r416183b (clang 14) se ainda não existir:
+          # Baixa clang-r487747c (clang 14) se ainda não existir:
           if [ ! -d "$HOME/aosp-clang" ]; then
-            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz"
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r487747c.tar.gz"
             mkdir -p "$HOME/aosp-clang"
             curl -Ls "$url" | tar -xz -C "$HOME/aosp-clang"
           fi
@@ -189,10 +192,10 @@ jobs:
           export KCONFIG_CONFIG="$OUT_DIR/.config"
       
           # ---------- Toolchain: fixar clang AOSP (compatível com trees antigas) ----------
-          # Usa clang-r416183b (clang 14) do AOSP se não houver um "Android clang" no PATH
+          # Usa clang-r487747c (clang 14) do AOSP se não houver um "Android clang" no PATH
           if ! clang --version 2>/dev/null | grep -qi 'Android' ; then
             if [ ! -d "$HOME/aosp-clang" ]; then
-              url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r416183b.tar.gz"
+              url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r487747c.tar.gz"
               mkdir -p "$HOME/aosp-clang"
               curl -Ls "$url" | tar -xz -C "$HOME/aosp-clang"
             fi
@@ -214,6 +217,9 @@ jobs:
           export OBJCOPY=llvm-objcopy
           export OBJDUMP=llvm-objdump
           export STRIP=llvm-strip
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+          export HOSTLD=ld.lld
       
           echo "=== clang em uso ==="
           clang --version || true
@@ -285,7 +291,7 @@ jobs:
           make LOCALVERSION= O="$OUT_DIR" syncconfig   | tee -a build.log
       
           # preparar com o alvo correto (gera bounds/timeconst já no target)
-          make O="$OUT_DIR" V=1 prepare | tee -a build.log || true
+          make O="$OUT_DIR" V=1 prepare | tee -a build.log
       
           # validar UTS_RELEASE <= 64
           if [ -f "$OUT_DIR/include/generated/utsrelease.h" ]; then
@@ -301,6 +307,8 @@ jobs:
                O="$OUT_DIR" \
                V=1 \
                KCFLAGS='-Wno-error' KBUILD_CFLAGS='-Wno-error' \
+               HOSTCFLAGS='-Wno-error -Wno-unused-function -Wno-unused-variable -Wno-gnu-variable-sized-type-not-at-end -Wno-address-of-packed-member -Wno-incompatible-function-pointer-types' \
+               HOSTCXXFLAGS='-Wno-error' \
                2>&1 | tee -a build.log
           rc=${PIPESTATUS[0]}
           set -e
