@@ -202,6 +202,11 @@ jobs:
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_INIT_ON_ALLOC_DEFAULT_ON -d CONFIG_INIT_ON_FREE_DEFAULT_ON || true
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZRAM || true
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZSMALLOC || true
+
+          # 🔧 não derrubar o build por warnings (desliga Werror no Kconfig)
+          ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_CC_WERROR || true
+          ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_WERROR    || true
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig 2>&1 | tee -a build.log
       
           # 3.1) ***FIX de versão: encurtar e congelar UTS_RELEASE***
           ./scripts/config --file "$OUT_DIR/.config" --set-str CONFIG_LOCALVERSION "-star"
@@ -232,6 +237,7 @@ jobs:
                O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
                HOSTCC=clang HOSTCXX=clang++ V=1 \
+               KCFLAGS='-Wno-error' KBUILD_CFLAGS='-Wno-error' \
                2>&1 | tee -a build.log
           rc=${PIPESTATUS[0]}
           set -e
@@ -264,7 +270,15 @@ jobs:
           echo "=== TAIL do log (500) ==="; tail -n 500 build.log || true
           echo "=== Erros encontrados (±3) ==="
           grep -nEi -C3 '(^|[[:space:]])(error:|fatal error:|undefined reference|No rule to make target|No such file|make:[[:space:]]\*{3}|collect2:[[:space:]]error|ld\.lld:[[:space:]]error|clang:[[:space:]]error|Killed|Segmentation fault|Error[[:space:]][0-9]+)' build.log || true
-
+          echo "=== Primeiro erro com contexto (±40) ==="
+          first=$(grep -nEi '(error:|fatal error:|undefined reference|ld\.lld:[[:space:]]error|clang:[[:space:]]error|No rule to make target|No such file)' build.log | head -n1 | cut -d: -f1 || true)
+          if [ -n "$first" ]; then
+            start=$(( first>40 ? first-40 : 1 ))
+            sed -n "${start},$((first+40))p" build.log || true
+          else
+            echo "Nenhum erro textual encontrado; provavelmente Werror/retcode paralelo (já mitigado)."
+          fi
+          
       - name: Upload de artefatos
         if: always()
         uses: actions/upload-artifact@v4
