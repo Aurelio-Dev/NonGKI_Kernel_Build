@@ -27,8 +27,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update -yq
-          sudo apt-get install -yqq bc bison flex libssl-dev build-essential \
-                                  ccache libelf-dev libncurses-dev rsync clang lld llvm zip
+          sudo apt-get install -yqq bc bison flex libssl-dev build-essential                                   ccache libelf-dev libncurses-dev rsync clang lld llvm zip
 
       - name: Enable 8G swap (estabiliza RAM)
         if: runner.os == 'Linux'
@@ -79,9 +78,10 @@ jobs:
           mkdir -p drivers/kernelsu
           rsync -a --delete "$src_dir"/ drivers/kernelsu/
           if [ ! -f drivers/kernelsu/Makefile ] && [ -f drivers/kernelsu/Kbuild ]; then
-            printf 'include $(src)/Kbuild\n' > drivers/kernelsu/Makefile
+            printf 'include $(src)/Kbuild
+' > drivers/kernelsu/Makefile
           fi
-          grep -q 'obj-y[[:space:]]\+\+=\s*kernelsu/' drivers/Makefile 2>/dev/null || echo 'obj-y += kernelsu/' >> drivers/Makefile
+          grep -q 'obj-y[[:space:]]*\+=\s*kernelsu/' drivers/Makefile 2>/dev/null || echo 'obj-y += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig 2>/dev/null || echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
           ls -la drivers/kernelsu | sed 's/^/KSU: /'
           grep -n 'kernelsu/Kconfig' drivers/Kconfig || true
@@ -109,8 +109,7 @@ jobs:
           set -euxo pipefail
           cd "$KERNEL_DIR"
           f="kernel/taskstats.c"
-          if grep -q 'zone_page_state *(.*NR_ZSPAGES)' "$f" && \
-             ! awk 'f&&/#endif/{exit} /NR_ZSPAGES/&&/zone_page_state/{f=1} END{exit !f}' "$f"; then
+          if grep -q 'zone_page_state *(.*NR_ZSPAGES)' "$f" &&              ! awk 'f&&/#endif/{exit} /NR_ZSPAGES/&&/zone_page_state/{f=1} END{exit !f}' "$f"; then
             perl -0777 -pe 's/(\n[[:space:]]*zspages[[:space:]]*\+=[[:space:]]*zone_page_state[[:space:]]*\([[:space:]]*zone[[:space:]]*,[[:space:]]*NR_ZSPAGES[[:space:]]*\)[[:space:]]*;[[:space:]]*\n)/\n#ifdef CONFIG_ZSMALLOC\1#endif\n/s' -i "$f"
             echo "→ Guard NR_ZSPAGES aplicado"
           else
@@ -147,48 +146,40 @@ jobs:
           rm -rf "$OUT_DIR" out
           mkdir -p "$OUT_DIR"
 
-      # --- NOVO: garantir include do SELinux para o subdiretório do KernelSU ---
       - name: Patch KernelSU for SELinux headers
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-      
-          # Suporta ambos layouts: drivers/kernelsu ou drivers/KernelSU
           KS_MK=""
           for p in drivers/kernelsu/Makefile drivers/KernelSU/Makefile; do
             if [ -f "$p" ]; then KS_MK="$p"; break; fi
           done
-          # Se por algum motivo não existir, não falha o pipeline
           [ -n "$KS_MK" ] || exit 0
-      
-          # Injeta apenas uma vez (idempotente)
           if ! grep -q 'selinux/include' "$KS_MK"; then
             cat >> "$KS_MK" <<'EOF'
-      
-      # ---- CI patch: ensure SELinux headers are visible when building KernelSU ----
-      ccflags-$(CONFIG_SECURITY_SELINUX) += -Isecurity/selinux/include
-      # -----------------------------------------------------------------------------
-      EOF
-          fi
-      # --- FIM DO NOVO STEP ---
 
+# ---- CI patch: ensure SELinux headers are visible when building KernelSU ----
+ccflags-$(CONFIG_SECURITY_SELINUX) += -Isecurity/selinux/include
+# -----------------------------------------------------------------------------
+EOF
+          fi
 
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-      
+
           # Saída consistente
           export OUT_DIR="${OUT_DIR:-$KERNEL_DIR/out}"
           export KBUILD_OUTPUT="$OUT_DIR"
           export KCONFIG_CONFIG="$OUT_DIR/.config"
-      
+
           # Asserts (falhar cedo se KSU sumiu ou não está referenciado)
           [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente antes do defconfig"; exit 6; }
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::drivers/Kconfig não referencia drivers/kernelsu/Kconfig"; exit 7; }
-      
+
           # 1) Resolver defconfig (começar limpo na ÁRVORE-FONTE)
           rm -f .config || true
           rm -rf include/config arch/arm64/include/generated || true
@@ -205,21 +196,19 @@ jobs:
           [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
 
-          # >>> zerar OUT_DIR antes de gerar .config (evita 'source tree is not clean' no OUT)
+          # zerar OUT_DIR antes de gerar .config (evita 'source tree is not clean' no OUT)
           rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
-      
+
           # 2) Gerar .config (não-interativo, com Clang) — agora sempre com LOCALVERSION=
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
 
           # reduzir peso de compilação
-          ./scripts/config --file "$OUT_DIR/.config" \
-            -d CONFIG_DEBUG_INFO -d CONFIG_DEBUG_INFO_DWARF4 -d CONFIG_DEBUG_INFO_BTF \
-            -d CONFIG_GCOV_KERNEL
-          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig
+          ./scripts/config --file "$OUT_DIR/.config"             -d CONFIG_DEBUG_INFO -d CONFIG_DEBUG_INFO_DWARF4 -d CONFIG_DEBUG_INFO_BTF             -d CONFIG_GCOV_KERNEL
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig 2>&1 | tee -a build.log
 
-          # 3) Congelar símbolos que abriam prompt em runs anteriores
+          # 3) Congelar símbolos que abriam prompts no --syncconfig
           chmod +x ./scripts/config
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_COMPAT_VDSO || true
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_SHADOW_CALL_STACK || true
@@ -234,16 +223,16 @@ jobs:
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_CC_WERROR || true
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_WERROR    || true
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig 2>&1 | tee -a build.log
-      
+
           # 3.1) ***FIX de versão: encurtar e congelar UTS_RELEASE***
           ./scripts/config --file "$OUT_DIR/.config" --set-str CONFIG_LOCALVERSION "-star"
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_LOCALVERSION_AUTO
-      
+
           # 4) Finalizar de forma NÃO-interativa (sem 'yes' pra não dar Broken pipe)
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig          2>&1 | tee -a build.log
-      
-          # 4.1) (Opcional) validar tamanho do UTS_RELEASE (<= 64 chars)
+
+          # 4.1) Validar tamanho do UTS_RELEASE (<= 64 chars)
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld prepare 2>&1 | tee -a build.log || true
           if [ -f "$OUT_DIR/include/generated/utsrelease.h" ]; then
             rel=$(grep -oP '(?<=^#define UTS_RELEASE ").*(?="$)' "$OUT_DIR/include/generated/utsrelease.h" || true)
@@ -251,41 +240,40 @@ jobs:
             echo "UTS_RELEASE='$rel' (len=$len)"
             [ "$len" -le 64 ] || { echo "::error::UTS_RELEASE > 64 chars"; exit 9; }
           fi
-      
+
           # (Opcional) amaciar o guard 'source tree is not clean' no Makefile do OUT
           sed -i -E 's/^[[:space:]]*false;[[:space:]]*$/: # pacified/' "$OUT_DIR"/Makefile || true
-      
+
           echo "→ Checando flags no .config"
           egrep -n '^(CONFIG_(COMPAT_VDSO|SHADOW_CALL_STACK|LTO_(NONE|CLANG)|RELR|INIT_STACK_|INIT_ON_(ALLOC|FREE)_DEFAULT_ON|ZSMALLOC|ZRAM|LOCALVERSION|LOCALVERSION_AUTO))=' "$OUT_DIR/.config" || true
-      
+
           # 5) Build
           set +e
-          make LOCALVERSION= -j8 \
-               O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
-               AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-               HOSTCC=clang HOSTCXX=clang++ V=1 \
-               KCFLAGS='-Wno-error' KBUILD_CFLAGS='-Wno-error' \
-               2>&1 | tee -a build.log
+          make LOCALVERSION= -j8                O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld                AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip                HOSTCC=clang HOSTCXX=clang++ V=1                KCFLAGS='-Wno-error' KBUILD_CFLAGS='-Wno-error'                2>&1 | tee -a build.log
           rc=${PIPESTATUS[0]}
           set -e
           exit $rc
 
-      - name: Empacotar com AnyKernel3
+      - name: Empacotar com AnyKernel3 (robusto)
         if: success()
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-          img=""
+          IMG=""
           for p in "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" "$OUT_DIR/arch/arm64/boot/Image"; do
-            [ -f "$p" ] && img="$p" && break
+            [ -f "$p" ] && IMG="$p" && break
           done
-          [ -z "$img" ] && { echo "::error::Kernel image não encontrado"; exit 7; }
+          [ -n "$IMG" ] || { echo "::error::Kernel image não encontrado em $OUT_DIR/arch/arm64/boot"; exit 7; }
           rm -rf AnyKernel3
           git clone --depth=1 --branch "${AK3_BRANCH}" "${AK3_SOURCE}" AnyKernel3
-          cp -a "$img" AnyKernel3/
+          # Ajustes mínimos do anykernel.sh
+          sed -ri 's@^(block=).*@\1boot@' AnyKernel3/anykernel.sh
+          sed -ri 's@^(is_slot_device=).*@\11@' AnyKernel3/anykernel.sh
+          grep -q '^device.name1=star' AnyKernel3/anykernel.sh || echo 'device.name1=star' >> AnyKernel3/anykernel.sh
+          cp -a "$IMG" AnyKernel3/
           cd AnyKernel3
-          zip -r ../kernel-star.zip ./*
+          zip -r9 ../kernel-star.zip ./*
 
       - name: Diagnóstico de falha (se houver)
         if: failure()
@@ -305,7 +293,7 @@ jobs:
           else
             echo "Nenhum erro textual encontrado; provavelmente Werror/retcode paralelo (já mitigado)."
           fi
-          
+
       - name: Upload de artefatos
         if: always()
         uses: actions/upload-artifact@v4
