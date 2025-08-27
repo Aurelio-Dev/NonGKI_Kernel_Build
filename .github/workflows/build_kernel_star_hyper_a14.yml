@@ -170,15 +170,15 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
-
+      
           export OUT_DIR="${OUT_DIR:-$KERNEL_DIR/out}"
           export KBUILD_OUTPUT="$OUT_DIR"
           export KCONFIG_CONFIG="$OUT_DIR/.config"
-
+      
           # sanity
           [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente"; exit 6; }
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::drivers/Kconfig não referencia drivers/kernelsu/Kconfig"; exit 7; }
-
+      
           # Resolver defconfig
           rm -f .config || true
           rm -rf include/config arch/arm64/include/generated || true
@@ -192,15 +192,15 @@ jobs:
           fi
           [ -n "$found" ] || { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
-
+      
           # zerar OUT_DIR antes do .config
           rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
-
+      
           # Gerar .config
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1 | tee  build.log
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig   | tee -a build.log
-
+      
           # Ajustes / overrides
           chmod +x ./scripts/config
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_COMPAT_VDSO || true
@@ -221,33 +221,50 @@ jobs:
             grep -RIlq "^[[:space:]]*config[[:space:]]+$sym\>" -- drivers arch fs kernel mm 2>/dev/null && \
               ./scripts/config --file "$OUT_DIR/.config" -e "CONFIG_${sym}" || true
           done
-
+      
           # não derrubar por warnings (Werror off)
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_CC_WERROR || true
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_WERROR    || true
-
+      
           # encurtar/selar versão
           ./scripts/config --file "$OUT_DIR/.config" --set-str CONFIG_LOCALVERSION "-star"
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_LOCALVERSION_AUTO
-
+      
           # reduzir peso da build
           ./scripts/config --file "$OUT_DIR/.config" \
             -d CONFIG_DEBUG_INFO -d CONFIG_DEBUG_INFO_DWARF4 -d CONFIG_DEBUG_INFO_BTF \
             -d CONFIG_GCOV_KERNEL || true
-
+      
           # selar sem prompts
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig | tee -a build.log
           make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig   | tee -a build.log
-
+      
+          # >>> correção: forçar alvo ARM64 para TODAS as fases (inclui prepare/bounds.c) <<<
+          export ARCH=arm64
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export LLVM=1
+          export LLVM_IAS=1
+          export CC=clang
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
+          # preparar com o alvo correto (gera bounds/timeconst já no target)
+          make O="$OUT_DIR" V=1 prepare | tee -a build.log || true
+          # <<< fim da correção >>>
+      
           # validar UTS_RELEASE <= 64
-          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld prepare | tee -a build.log || true
           if [ -f "$OUT_DIR/include/generated/utsrelease.h" ]; then
             rel=$(grep -oP '(?<=^#define UTS_RELEASE ").*(?="$)' "$OUT_DIR/include/generated/utsrelease.h" || true)
             len=$(printf "%s" "$rel" | wc -c)
             echo "UTS_RELEASE='$rel' (len=$len)"
             [ "$len" -le 64 ] || { echo "::error::UTS_RELEASE > 64 chars"; exit 9; }
           fi
-
+      
           # build final
           set +e
           make LOCALVERSION= -j8 \
