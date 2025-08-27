@@ -6,16 +6,18 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     env:
+      # ---- fontes e parâmetros principais ----
       KERNEL_SOURCE: https://github.com/EndCredits/android_kernel_xiaomi_sm8350-miui.git
       KERNEL_BRANCH: hyper-14
       DEFCONFIG_NAME: vendor/star_defconfig
 
-      AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
-      AK3_BRANCH: master
-
       KERNELSU_SOURCE: https://github.com/tiann/KernelSU.git
       KERNELSU_BRANCH: main
+
+      AK3_SOURCE: https://github.com/osm0sis/AnyKernel3.git
+      AK3_BRANCH: master
 
       KERNEL_DIR: ${{ github.workspace }}/kernel-src
       OUT_DIR: ${{ github.workspace }}/kernel-src/out
@@ -30,7 +32,8 @@ jobs:
           set -euxo pipefail
           sudo apt-get update -yq
           sudo apt-get install -yqq bc bison flex libssl-dev build-essential \
-                                   ccache libelf-dev libncurses-dev rsync clang lld llvm zip
+                                   ccache libelf-dev libncurses-dev rsync \
+                                   clang lld llvm zip
 
       - name: Enable 8G swap (estabiliza RAM)
         if: runner.os == 'Linux'
@@ -59,33 +62,38 @@ jobs:
           rm -f .config || true
           rm -rf include/config arch/arm64/include/generated || true
           git reset --hard HEAD || true
-          # Preserva drivers/kernelsu para acelerar iterações, se já existir
+          # Preserva drivers/kernelsu se já existir (acelera iteração)
           git clean -fdx -e drivers/kernelsu -e drivers/kernelsu/** || true
           make ARCH=arm64 mrproper || true
           rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
 
-      - name: Injetar/normalizar KernelSU em drivers/kernelsu (layout-agnóstico)
+      - name: Ensure KernelSU present (after clean)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+
           rm -rf drivers/kernelsu drivers/KernelSU .kernelsu_tmp || true
-          git clone --depth=1 --branch "${KERNELSU_BRANCH:-main}" "${KERNELSU_SOURCE:-https://github.com/tiann/KernelSU.git}" .kernelsu_tmp
+          git clone --depth=1 --branch "${KERNELSU_BRANCH}" "${KERNELSU_SOURCE}" .kernelsu_tmp
+
           src_dir=""
           for cand in ".kernelsu_tmp/kernel" ".kernelsu_tmp/KernelSU/kernel" ".kernelsu_tmp"; do
             [ -f "$cand/Kconfig" ] && src_dir="$cand" && break
           done
-          [ -n "$src_dir" ] || { echo "::error::Nenhum Kconfig encontrado no repositório do KernelSU"; exit 5; }
+          [ -n "$src_dir" ] || { echo "::error::Kconfig do KernelSU não encontrado"; exit 5; }
+
           mkdir -p drivers/kernelsu
           rsync -a --delete "$src_dir"/ drivers/kernelsu/
+
+          # compat Kbuild->Makefile quando necessário
           if [ ! -f drivers/kernelsu/Makefile ] && [ -f drivers/kernelsu/Kbuild ]; then
             printf 'include $(src)/Kbuild\n' > drivers/kernelsu/Makefile
           fi
+
+          # garantir referência em drivers/
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
           grep -qE 'obj-(y|m).*=.*kernelsu/?' drivers/Makefile || echo 'obj-y += kernelsu/' >> drivers/Makefile
-          ls -la drivers/kernelsu | sed 's/^/KSU: /'
-          grep -n 'kernelsu/Kconfig' drivers/Kconfig || true
 
       - name: Neutralizar glue de SELinux do KernelSU (robusto)
         shell: bash
@@ -117,10 +125,10 @@ jobs:
           if ! grep -q 'selinux/include' "$KS_MK"; then
             cat >> "$KS_MK" <<'EOF'
 
-# ---- CI patch: ensure SELinux headers are visible when building KernelSU ----
-ccflags-$(CONFIG_SECURITY_SELINUX) += -Isecurity/selinux/include
-# -----------------------------------------------------------------------------
-EOF
+          # ---- CI patch: ensure SELinux headers are visible when building KernelSU ----
+          ccflags-$(CONFIG_SECURITY_SELINUX) += -Isecurity/selinux/include
+          # -----------------------------------------------------------------------------
+          EOF
           fi
 
       - name: Guard NR_ZSPAGES in taskstats.c (robusto)
@@ -142,39 +150,38 @@ EOF
         run: |
           set -euxo pipefail
           cd "$KERNEL_DIR"
+
           export OUT_DIR="${OUT_DIR:-$KERNEL_DIR/out}"
           export KBUILD_OUTPUT="$OUT_DIR"
           export KCONFIG_CONFIG="$OUT_DIR/.config"
 
-          # Asserts
-          [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente antes do defconfig"; exit 6; }
+          # sanity
+          [ -f drivers/kernelsu/Kconfig ] || { echo "::error::drivers/kernelsu/Kconfig ausente"; exit 6; }
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || { echo "::error::drivers/Kconfig não referencia drivers/kernelsu/Kconfig"; exit 7; }
 
-          # 1) Resolver defconfig (limpo na árvore-fonte)
+          # Resolver defconfig
           rm -f .config || true
           rm -rf include/config arch/arm64/include/generated || true
           want="${DEFCONFIG_NAME}"
           base="${want##*/}"
-          path1="arch/arm64/configs/${want}"
           found=""
-          if [[ -f "$path1" ]]; then
+          if [ -f "arch/arm64/configs/${want}" ]; then
             found="$want"
-          else
-            cand="$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true)"
-            [[ -n "$cand" ]] && found="${cand#arch/arm64/configs/}"
+          elif cand=$(ls arch/arm64/configs/**/"$base" 2>/dev/null | head -n1 || true); then
+            found="${cand#arch/arm64/configs/}"
           fi
-          [[ -z "$found" ]] && { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
+          [ -n "$found" ] || { echo "::error::Defconfig '${want}' não encontrado"; exit 2; }
           echo "→ Usando defconfig: $found"
 
-          # zerar OUT_DIR antes de gerar .config
+          # zerar OUT_DIR antes do .config
           rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
 
-          # 2) Gerar .config (não-interativo, com Clang) — sempre com LOCALVERSION=
-          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1        2>&1 | tee  build.log
-          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig        2>&1 | tee -a build.log
+          # Gerar .config
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld "$found" V=1 | tee  build.log
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig   | tee -a build.log
 
-          # 3) Congelar símbolos que causavam prompts e ajustes
+          # Ajustes / overrides
           chmod +x ./scripts/config
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_COMPAT_VDSO || true
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_SHADOW_CALL_STACK || true
@@ -184,8 +191,7 @@ EOF
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_INIT_ON_ALLOC_DEFAULT_ON -d CONFIG_INIT_ON_FREE_DEFAULT_ON || true
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZRAM || true
           ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_ZSMALLOC || true
-
-          # Forçar KSU/SuSFS quando presentes
+          # KSU / SuSFS se existirem
           if grep -qE '^[[:space:]]*config[[:space:]]+KSU\>' drivers/kernelsu/Kconfig 2>/dev/null; then
             ./scripts/config --file "$OUT_DIR/.config" -e CONFIG_KSU || true
           elif grep -qE '^[[:space:]]*config[[:space:]]+KERNELSU\>' drivers/kernelsu/Kconfig 2>/dev/null; then
@@ -196,25 +202,25 @@ EOF
               ./scripts/config --file "$OUT_DIR/.config" -e "CONFIG_${sym}" || true
           done
 
-          # 🔧 não derrubar o build por warnings (desliga Werror no Kconfig)
+          # não derrubar por warnings (Werror off)
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_CC_WERROR || true
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_WERROR    || true
 
-          # ***FIX UTS_RELEASE***: encurtar e congelar versão
+          # encurtar/selar versão
           ./scripts/config --file "$OUT_DIR/.config" --set-str CONFIG_LOCALVERSION "-star"
           ./scripts/config --file "$OUT_DIR/.config" -d CONFIG_LOCALVERSION_AUTO
 
-          # Reduzir peso de compilação (menos RAM/tempo)
+          # reduzir peso da build
           ./scripts/config --file "$OUT_DIR/.config" \
             -d CONFIG_DEBUG_INFO -d CONFIG_DEBUG_INFO_DWARF4 -d CONFIG_DEBUG_INFO_BTF \
             -d CONFIG_GCOV_KERNEL || true
 
-          # Selar sem interação
-          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig 2>&1 | tee -a build.log
-          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig   2>&1 | tee -a build.log
+          # selar sem prompts
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld olddefconfig | tee -a build.log
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld syncconfig   | tee -a build.log
 
-          # Validar tamanho do UTS_RELEASE (<= 64 chars)
-          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld prepare 2>&1 | tee -a build.log || true
+          # validar UTS_RELEASE <= 64
+          make LOCALVERSION= O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld prepare | tee -a build.log || true
           if [ -f "$OUT_DIR/include/generated/utsrelease.h" ]; then
             rel=$(grep -oP '(?<=^#define UTS_RELEASE ").*(?="$)' "$OUT_DIR/include/generated/utsrelease.h" || true)
             len=$(printf "%s" "$rel" | wc -c)
@@ -222,10 +228,7 @@ EOF
             [ "$len" -le 64 ] || { echo "::error::UTS_RELEASE > 64 chars"; exit 9; }
           fi
 
-          echo "→ Checando flags no .config"
-          egrep -n '^(CONFIG_(COMPAT_VDSO|SHADOW_CALL_STACK|LTO_(NONE|CLANG)|RELR|INIT_STACK_|INIT_ON_(ALLOC|FREE)_DEFAULT_ON|ZSMALLOC|ZRAM|LOCALVERSION|LOCALVERSION_AUTO|KSU|KERNELSU|SUSFS))=' "$OUT_DIR/.config" || true
-
-          # 🏗️ build (com proteção anti-Werror e paralelismo moderado)
+          # build final
           set +e
           make LOCALVERSION= -j8 \
                O="$OUT_DIR" ARCH=arm64 LLVM=1 CC=clang LD=ld.lld \
@@ -247,11 +250,14 @@ EOF
           [ -f "$IMG" ] || { echo "::error::Image.gz-dtb não encontrado"; exit 7; }
           sig=$(head -c2 "$IMG" | hexdump -v -e '1/1 "%02X"')
           [ "$sig" = "1F8B" ] || { echo "::error::Arquivo não é gzip (esperado Image.gz-dtb)"; exit 7; }
+
           rm -rf AnyKernel3
           git clone --depth=1 --branch "${AK3_BRANCH}" "${AK3_SOURCE}" AnyKernel3
+
           sed -ri 's@^(block=).*@\1boot@' AnyKernel3/anykernel.sh
           sed -ri 's@^(is_slot_device=).*@\11@' AnyKernel3/anykernel.sh
           grep -q '^device.name1=star' AnyKernel3/anykernel.sh || echo 'device.name1=star' >> AnyKernel3/anykernel.sh
+
           cp -a "$IMG" AnyKernel3/
           cd AnyKernel3
           zip -r9 ../kernel-star.zip ./*
