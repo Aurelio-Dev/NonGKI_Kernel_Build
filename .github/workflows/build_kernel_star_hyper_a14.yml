@@ -147,6 +147,33 @@ jobs:
           rm -rf "$OUT_DIR" out
           mkdir -p "$OUT_DIR"
 
+      # --- NOVO: garantir include do SELinux para o subdiretório do KernelSU ---
+      - name: Patch KernelSU for SELinux headers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_DIR"
+      
+          # Suporta ambos layouts: drivers/kernelsu ou drivers/KernelSU
+          KS_MK=""
+          for p in drivers/kernelsu/Makefile drivers/KernelSU/Makefile; do
+            if [ -f "$p" ]; then KS_MK="$p"; break; fi
+          done
+          # Se por algum motivo não existir, não falha o pipeline
+          [ -n "$KS_MK" ] || exit 0
+      
+          # Injeta apenas uma vez (idempotente)
+          if ! grep -q 'selinux/include' "$KS_MK"; then
+            cat >> "$KS_MK" <<'EOF'
+      
+      # ---- CI patch: ensure SELinux headers are visible when building KernelSU ----
+      ccflags-$(CONFIG_SECURITY_SELINUX) += -Isecurity/selinux/include
+      # -----------------------------------------------------------------------------
+      EOF
+          fi
+      # --- FIM DO NOVO STEP ---
+
+
       - name: Configurar e compilar (robusto)
         shell: bash
         run: |
